@@ -1,0 +1,14 @@
+# Cargo tracking + Excel reporting. Pinned to what is verified working here.
+#
+#   pip install -r requirements.txt
+#   playwright install chromium        # one-time, ~150 MB; needed for Maersk
+#
+# Python 3.11 or newer (the code uses `X | None` annotations at runtime).
+
+# --- tracking ---------------------------------------------------------------
+requests>=2.32,<3            # MSC and Maersk HTTP calls
+curl_cffi>=0.16,<0.17        # TLS impersonation; without it MSC returns 403
+playwright>=1.40,<2          # the only working Maersk path (Akamai bot manager)
+
+# --- reporting --------------------------------------------------------------
+openpyxl>=3.1,<4             # reads the commercial sheet, writes the report
