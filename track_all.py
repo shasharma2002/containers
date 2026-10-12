@@ -63,6 +63,7 @@ from pathlib import Path
 import carrier_id
 import maersk_track
 import msc_track
+import read_master
 import read_sheet
 from pipeline import CARRIER_NAMES, flatten, write_json
 
@@ -120,19 +121,47 @@ def load_numbers(args) -> list[str]:
 
 
 def load_sheet(args) -> list[dict] | None:
-    """Try BL-sheet mode on a single .xlsx input.
+    """Try workbook mode on a single .xlsx input.
 
-    Returns the shipment list if a BL NO. header was found (or --sheet-mode
-    forced it), None if this isn't that kind of file at all -- the caller
-    falls back to the legacy container-list path. If --sheet-mode was passed
-    explicitly and the header still isn't there, that's a real error and we
-    let read_sheet.SheetError propagate instead of silently falling back.
+    TWO WORKBOOK FORMATS, AUTO-DETECTED
+    -----------------------------------
+    master   all_companies.xlsx -- one sheet per company, company taken from the
+             tab name, and NO shipping-line column. read_master.py. Non-company
+             tabs (archives, the bulk-tanker sheet) are skipped and reported.
+    single   bl_list.xlsx -- one sheet, a SHIPPING LINE column, company implicit.
+             read_sheet.py.
+
+    Detection is on content, not filename: read_master.looks_like_master asks
+    whether any tab classifies as a live per-company sheet. The older format
+    keeps working untouched, so nothing already scheduled breaks.
+
+    Returns the shipment list, or None if this isn't a workbook we understand --
+    the caller then falls back to the legacy container-list path. With
+    --sheet-mode passed explicitly, a parse failure is a real error and is
+    allowed to propagate rather than silently falling back.
     """
     if len(args.inputs) != 1:
         return None
     path = Path(args.inputs[0])
     if not (path.exists() and path.suffix.lower() in (".xlsx", ".xlsm")):
         return None
+
+    if read_master.looks_like_master(path):
+        result = read_master.get_shipments(path, args.sheet)
+        trackable = sum(1 for s in result["shipments"] if s["bl_number"])
+        print(f"# master-sheet mode: {len(result['sheets'])} company sheet(s), "
+              f"{len(result['shipments'])} row(s), {trackable} with a BL",
+              file=sys.stderr)
+        for info in result["sheets"]:
+            print(f"#   {info['company']:<22} {info['rows']:>3} row(s), "
+                  f"{info['trackable']:>3} trackable", file=sys.stderr)
+        for info in result["skipped"]:
+            print(f"#   skipped {info['sheet']:<22} ({info['layout']}) "
+                  f"{info['reason'].split(' -- ')[0]}", file=sys.stderr)
+        if result["skipped_no_bl"]:
+            print(f"#   {result['skipped_no_bl']} row(s) have no BL yet -- kept "
+                  f"for the report, not tracked", file=sys.stderr)
+        return result["shipments"]
 
     if args.sheet_mode:
         result = read_sheet.get_shipments(path, args.sheet)
@@ -331,7 +360,6 @@ def build_shipments(shipments: list[dict], tracked: dict[str, dict],
     for s in shipments:
         result = tracked.get(s["bl_number"])
         tracked_eta = tracked_status = tracked_location = None
-        eta_variance_days = None
         container_count = 0
         containers_str = None
 
@@ -352,19 +380,11 @@ def build_shipments(shipments: list[dict], tracked: dict[str, dict],
             if latest:
                 tracked_location = latest.get("latest_move")
 
-            sheet_eta = s.get("sheet_eta_date")
-            if tracked_eta and sheet_eta:
-                try:
-                    carrier_date = datetime.fromisoformat(tracked_eta[:10])
-                    sheet_date = datetime.fromisoformat(sheet_eta)
-                    eta_variance_days = (carrier_date - sheet_date).days
-                except ValueError:
-                    eta_variance_days = None
-
         out.append({
             "run_id": run_id,
             "snapshot_at": snapshot,
             "row_number": s["row_number"],
+            "company": s.get("company"),
             "bl_number": s["bl_number"],
             "carrier_name": CARRIER_NAMES.get(s["carrier"]) or s.get("shipping_line_raw"),
             "beneficiary": s["beneficiary"],
@@ -375,12 +395,25 @@ def build_shipments(shipments: list[dict], tracked: dict[str, dict],
             "amount": s["amount"],
             "delivery_terms": s["delivery_terms"],
             "free_days": s["free_days"],
-            "sheet_eta_date": s["sheet_eta_date"],
-            "sheet_eta_place": s["sheet_eta_place"],
+            # The sheet's own ETA columns are kept as RAW TEXT only. They are
+            # typed by hand and not maintained against the carriers, so no
+            # parsed sheet date is published and no variance is computed against
+            # one -- the report's arrival dates come from the carriers. See
+            # TRUST_SHEET_DATES in read_master.py.
+            "sheet_eta_raw": s.get("sheet_eta_raw"),
+            "eta_port_raw": s.get("eta_port_raw"),
+            "free_time_raw": s.get("free_time_raw"),
+            "origin": s.get("origin"),
+            "port_of_loading": s.get("port_of_loading"),
+            "rate": s.get("rate"),
+            "amount_derived": s.get("amount_derived"),
+            "sheet_container_count": s.get("container_count"),
+            "container_size": s.get("container_size"),
+            "document_position": s.get("document_position"),
+            "lc_no": s.get("lc_no"),
             "tracked_eta": tracked_eta,
             "tracked_status": tracked_status,
             "tracked_location": tracked_location,
-            "eta_variance_days": eta_variance_days,
             "container_count": container_count,
             "containers": containers_str,
         })
@@ -402,7 +435,7 @@ def run_legacy_mode(args, numbers: list[str]) -> int:
     pairs, labels = [], {}
     for number in numbers:
         info = carrier_id.classify(number)
-        hint = info["carrier"] if info["confidence"] == "high" else None
+        hint = info["carrier"] if info["confidence"] in ("high", "medium") else None
         labels[number] = (CARRIER_NAMES.get(hint, hint) if hint
                           else f"? ({info['note'].split(' -- ')[0]})")
         pairs.append((number, hint))
@@ -451,7 +484,10 @@ def run_sheet_mode(args, shipments: list[dict]) -> int:
     resolved: dict[str, dict] = {}
     for s in shipments:
         bl = s["bl_number"]
-        if bl in resolved:
+        # The master workbook keeps rows whose BL has not been issued yet. They
+        # belong in the report as commercial data, but there is nothing to look
+        # up, so they never reach a carrier.
+        if not bl or bl in resolved:
             continue
         shipping_raw = (s["shipping_line_raw"] or "").strip().upper()
         if s["carrier"]:
@@ -463,8 +499,26 @@ def run_sheet_mode(args, shipments: list[dict]) -> int:
             # SHIPPING LINE blank or unrecognised -- fall back to BIC/BL
             # prefix classification, same as legacy mode.
             info = carrier_id.classify(bl)
-            hint = info["carrier"] if info["confidence"] == "high" else None
-            if hint is None:
+            hint = info["carrier"] if info["confidence"] in ("high", "medium") else None
+
+            if hint is not None and hint not in ADAPTERS:
+                # The BL's own prefix names a carrier we recognise but cannot
+                # fetch -- HLCUMTR... is unmistakably Hapag-Lloyd. That is a
+                # REAL shipment with no adapter, not a failed lookup, and the
+                # two need completely different responses.
+                #
+                # This path exists because the master workbook has no SHIPPING
+                # LINE column: previously an unsupported line was caught by its
+                # sheet text, and without this check a Hapag BL would be tried
+                # against MSC, then against Maersk through a 20s browser
+                # timeout, and finally recorded as "not found" -- which reads as
+                # a bad number rather than a gap in carrier coverage. It also
+                # covers COSCO/CMA CGM/ONE/Evergreen/Yang Ming the moment one
+                # of their BLs appears.
+                resolved[bl] = {"hint": None,
+                                "unsupported_code": hint,
+                                "unsupported": info["carrier_name"]}
+            elif hint is None:
                 # Neither SHIPPING LINE nor the BL's own shape identifies an
                 # ocean carrier at all. On this sheet that's not a carrier we
                 # failed to recognise -- it's inland/truck cargo (seen:
@@ -477,12 +531,20 @@ def run_sheet_mode(args, shipments: list[dict]) -> int:
 
     unsupported = {bl: v for bl, v in resolved.items() if "unsupported" in v}
     for bl, v in unsupported.items():
-        name = UNSUPPORTED_SHIPPING_LINES[v["unsupported"]]
+        # Two ways to get here: the sheet named a line we have no adapter for,
+        # or the BL's own prefix did. Same conclusion, different evidence.
+        if "unsupported_code" in v:
+            name = v["unsupported"]
+            evidence = f"BL prefix identifies {v['unsupported_code']}"
+        else:
+            name = UNSUPPORTED_SHIPPING_LINES[v["unsupported"]]
+            evidence = f"SHIPPING LINE={v['unsupported']}"
         print(f"  {bl:<20} -> unsupported carrier: {name}", file=sys.stderr)
         errors.append({
             "run_id": run_id, "snapshot_at": snapshot, "query": bl,
             "classified_as": name, "confidence": "high", "carriers_tried": "",
-            "error": f"unsupported_carrier: {v['unsupported']}",
+            "error": f"unsupported_carrier: {name} ({evidence}) -- no adapter "
+                     f"exists for this line, so it was not looked up",
         })
 
     no_carrier = {bl: v for bl, v in resolved.items() if "no_carrier" in v}

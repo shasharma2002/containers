@@ -121,6 +121,39 @@ def findings(data, as_of) -> list[dict]:
             forecast_current[0].get("container_id"))
 
     # ---- events ----------------------------------------------------------- #
+    no_eta = [c for c in containers
+              if c["eta_dt"] is None and c["status_bucket"] != "Delivered"]
+    if no_eta:
+        add("Warning", "Containers", "No ETA from the carrier", len(no_eta),
+            "Neither pod_eta nor final_pod_eta is populated. Normal for MSC, "
+            "which supplies no forward schedule -- use the last confirmed move "
+            "as the progress signal for those. Not a delay.",
+            no_eta[0].get("container_id"))
+
+    stale_rows = [c for c in containers
+                  if (c["snapshot_age_days"] or 0) >= 7]
+    if stale_rows:
+        add("Warning", "Pipeline", "Tracking data not refreshed", len(stale_rows),
+            "These containers were last looked up %d or more days ago, so their "
+            "status may have changed since. This is about the pipeline, not the "
+            "cargo -- re-run track_all.py."
+            % 7, stale_rows[0].get("container_id"))
+
+    no_destination = [c for c in containers if not c.get("destination")]
+    if no_destination:
+        add("Info", "Containers", "No destination from the carrier",
+            len(no_destination),
+            "The carrier returned no destination city or country, so no arrival "
+            "expectation can be formed for these containers.",
+            no_destination[0].get("container_id"))
+
+    no_actual = [c for c in containers if c["actual_events"] == 0]
+    if no_actual:
+        add("Critical", "Containers", "No confirmed movement", len(no_actual),
+            "The carrier returned only forecasts, or nothing at all, for these "
+            "containers -- so there is no confirmed position to report.",
+            no_actual[0].get("container_id"))
+
     no_date = [e for e in events if e["event_dt"] is None]
     if no_date:
         add("Warning", "Events", "Missing or unparseable event date", len(no_date),
@@ -203,13 +236,27 @@ def findings(data, as_of) -> list[dict]:
                 "against Tracking Failures -- an unsupported carrier or an "
                 "inland movement will land here permanently and is not a fault.",
                 untracked[0].get("bl_number"))
-        bad_eta = [s for s in data.shipments
-                   if s.get("sheet_eta_date") and s["sheet_eta_dt"] is None]
-        if bad_eta:
-            add("Warning", "Shipments", "Unparseable sheet ETA", len(bad_eta),
-                "The ETA typed on the commercial sheet is not a readable date, "
-                "so no variance against the carrier ETA can be computed.",
-                repr(bad_eta[0].get("sheet_eta_date")))
+        no_free_days = [s for s in data.shipments
+                        if s.get("bl_number") and s.get("free_days") is None]
+        if no_free_days:
+            add("Info", "Shipments", "No free-days count on the sheet",
+                len(no_free_days),
+                "The FREE TIME cell is empty, or holds a date rather than a day "
+                "count. Sheet dates are not used, so no free-time expiry can be "
+                "worked out for these rows and detention cannot be tracked. "
+                "Enter a number of days to fix it.",
+                no_free_days[0].get("bl_number"))
+
+        ignored = [s for s in data.shipments
+                   if s.get("sheet_eta_date") or s.get("eta_variance_days") is not None]
+        if ignored:
+            add("Info", "Shipments", "Sheet dates present but ignored", len(ignored),
+                "These rows were written before the commercial sheet's own dates "
+                "were dropped. The values are not read: those columns are typed "
+                "by hand and not maintained against the carriers, so every "
+                "arrival date on this report comes from the carrier instead. "
+                "Re-run the tracker to stop writing them.",
+                ignored[0].get("bl_number"))
 
     if not out:
         add("Info", "All", "No issues detected", 0,
@@ -272,6 +319,10 @@ def reconcile(data) -> tuple[list[dict], bool]:
 
     if data.files_found.get("shipments.json") is not None:
         collapsed = len(data.raw_shipments) - len(data.shipments)
+        # "On report" means reaching the analysis, not appearing on a visible
+        # sheet: the commercial columns now live on the hidden Raw Sheet Rows
+        # layer, and the rows themselves drive the Shipments and Free Time
+        # sheets through their BL.
         line("shipments.json", len(data.raw_shipments), len(data.shipments),
              len(data.raw_shipments), collapsed,
              "Duplicate/superseded copies of the same sheet row_number "

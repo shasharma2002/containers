@@ -89,12 +89,15 @@ MONEY_FMT = "#,##0.00"
 # Sheet names, in workbook order. Kept in one place because the Dashboard's
 # navigation links and the hyperlinks between sheets both reference them.
 S_DASH = "Dashboard"
-S_BLS = "BL Summary"
+S_BLS = "Shipments"
+S_FREETIME = "Free Time & Detention"
+S_COMPANIES = "Company Summary"
+S_PORTS = "Ports & Hubs"
+S_LANES = "Lane Performance"
 S_CONTAINERS = "Container Summary"
 S_EVENTS = "Event History"
 S_CARRIERS = "Carrier Summary"
-S_EXCEPTIONS = "Exceptions"
-S_SHIPMENTS = "Commercial Shipments"
+S_EXCEPTIONS = "Action Required"
 S_FAILURES = "Tracking Failures"
 S_QUALITY = "Data Quality"
 S_STATUS_MAP = "Status Mapping"
@@ -102,6 +105,7 @@ S_CARRIER_MAP = "Carrier Mapping"
 S_RUNS = "Run History"
 S_RAW_CONTAINERS = "Raw Containers"
 S_RAW_EVENTS = "Raw Events"
+S_RAW_SHIPMENTS = "Raw Sheet Rows"
 
 
 @dataclass
@@ -214,10 +218,16 @@ def _table(ws, columns: list[Column], rows: list[dict], name: str,
     return first, last
 
 
-def _severity_rules(ws, letter: str, first: int, last: int,
+def _severity_rules(ws, letter: str | None, first: int, last: int,
                     critical=("Critical",), warning=("Warning",), good=("OK",)) -> None:
-    """Colour a text column by severity. Silent when the sheet is empty."""
-    if last < first:
+    """Colour a text column by severity.
+
+    Silent when the sheet is empty, and silent when `letter` is None -- which is
+    what _letter() returns for a column that has been removed. Without that
+    guard, trimming a column fails inside an openpyxl descriptor with a
+    TypeError that names neither the sheet nor the column.
+    """
+    if letter is None or last < first:
         return
     span = "%s%d:%s%d" % (letter, first, letter, last)
     for values, fill, font in ((critical, RED_FILL, RED_FONT),
@@ -228,10 +238,13 @@ def _severity_rules(ws, letter: str, first: int, last: int,
                 operator="equal", formula=['"%s"' % value], fill=fill, font=font))
 
 
-def _threshold_rules(ws, letter: str, first: int, last: int,
+def _threshold_rules(ws, letter: str | None, first: int, last: int,
                      warn: int, critical: int) -> None:
-    """Amber at or above `warn`, red at or above `critical`. Red rule first."""
-    if last < first:
+    """Amber at or above `warn`, red at or above `critical`. Red rule first.
+
+    Silent for a removed column -- see _severity_rules.
+    """
+    if letter is None or last < first:
         return
     span = "%s%d:%s%d" % (letter, first, letter, last)
     ws.conditional_formatting.add(span, CellIsRule(
@@ -381,52 +394,42 @@ def _dashboard(wb, data, kpi: dict, dist: dict, available: list[str]) -> None:
     # Tiles. Band 1 is the fleet at the grain the business works in (BLs),
     # band 2 is what needs action, band 3 is how the consignments are moving,
     # band 4 is the state of the data behind the report.
+    # Ten tiles. The previous twenty-four could not be read at a glance, which
+    # is the only thing a tile is for -- anything that needs studying belongs on
+    # a sheet. Band 1 is the fleet, band 2 is what needs action, band 3 is the
+    # state of the data behind it.
     tiles = [
-        ("SHIPMENTS (BLs)", kpi["total_shipments"],
-         "bills of lading tracked -- the grain cargo is booked in", False),
+        ("SHIPMENTS", kpi["total_shipments"],
+         "bills of lading tracked", False),
         ("CONTAINERS", kpi["total_containers"],
-         "%s boxes per BL on average, largest %d"
+         "%s boxes per BL, largest %d"
          % (kpi["avg_containers_per_bl"], kpi["largest_bl"]), False),
-        ("SHIPMENTS IN TRANSIT", kpi["shipments_in_transit"],
+        ("IN TRANSIT", kpi["shipments_in_transit"],
          "%d containers moving" % kpi["in_transit"], False),
-        ("SHIPMENTS DELIVERED", kpi["shipments_delivered"],
-         "%d containers delivered or returned empty" % kpi["delivered"], False),
+        ("DELIVERED", kpi["shipments_delivered"],
+         "%d containers delivered" % kpi["delivered"], False),
 
-        ("SHIPMENTS NEEDING ATTENTION", kpi["shipments_attention"],
-         "%d critical; see Exceptions" % kpi["shipments_critical"],
+        ("NEEDS ATTENTION", kpi["shipments_attention"],
+         "%d critical -- see Action Required" % kpi["shipments_critical"],
          kpi["shipments_attention"] > 0),
-        ("DELAYED (ETA SLIPPED)", kpi["shipments_delayed"],
-         "carrier moved its own ETA later; avg %s days"
-         % (kpi["avg_eta_slip"] if kpi["avg_eta_slip"] is not None else "n/a"),
-         kpi["shipments_delayed"] > 0),
+        ("DELAYED", kpi["shipments_delayed"],
+         "carrier moved its own ETA later", kpi["shipments_delayed"] > 0),
         ("ETA PASSED", kpi["shipments_overdue"],
-         "ETA in the past, no arrival reported", kpi["shipments_overdue"] > 0),
-        ("SPLIT SHIPMENTS", kpi["split_shipments"],
-         "%d container(s) not travelling with the rest of their BL"
-         % kpi["split_containers"], kpi["split_shipments"] > 0),
+         "ETA gone by, no arrival reported", kpi["shipments_overdue"] > 0),
+        ("FREE TIME AT RISK", kpi["free_time_expired"] + kpi["free_time_expiring"],
+         "containers at port, expired or within %d days"
+         % analyze.FREE_TIME_WARN_DAYS,
+         (kpi["free_time_expired"] + kpi["free_time_expiring"]) > 0),
 
-        ("NO MOVEMENT %d DAYS+" % analyze.STALE_WARN_DAYS, kpi["shipments_stale"],
-         "shipments needing a look; staleness is not proof of delay",
-         kpi["shipments_stale"] > 0),
-        ("MULTI-CONTAINER BLs", kpi["multi_container_bls"],
-         "consignments of more than one box; the rest are single lookups", False),
-        ("ACTIVITY LAST %d DAYS" % analyze.RECENT_ACTIVITY_DAYS, kpi["recent_events"],
-         "confirmed events across %d containers" % kpi["recent_containers"], False),
-        ("CONTAINERS AT ORIGIN", kpi["at_origin"],
-         "received, not yet loaded on a vessel", False),
-
-        ("CARRIERS WITH DATA", "%d of %d" % (kpi["target_carriers_with_data"],
-                                             kpi["target_carriers"]),
-         "of the eight target carriers; see Carrier Mapping", False),
+        ("CONTAINERS AT PORT", kpi["containers_at_port"],
+         "ashore, awaiting collection", False),
+        ("WAITING AT A HUB", kpi["at_hub"],
+         "between vessels", False),
         ("TRACKING FAILURES", kpi["tracking_failures"],
-         "not found, unsupported carrier or inland cargo",
-         kpi["tracking_failures"] > 0),
-        ("MISSING ETA", kpi["missing_eta"],
-         "containers with no carrier ETA; normal for MSC",
-         kpi["missing_eta"] > 0),
+         "see Tracking Failures", kpi["tracking_failures"] > 0),
         ("TRACKING DATA AGE", "%s d" % (kpi["oldest_snapshot"] and
                                         (kpi["as_of"] - kpi["oldest_snapshot"]).days),
-         "oldest row on the report; re-run the tracker to refresh", False),
+         "oldest row; re-run the tracker to refresh", False),
     ]
     for index, (label, value, note, alert) in enumerate(tiles):
         band, slot = divmod(index, TILES_PER_BAND)
@@ -436,33 +439,30 @@ def _dashboard(wb, data, kpi: dict, dist: dict, available: list[str]) -> None:
     # Each section below is a table plus a chart of the same numbers: the table
     # so a figure can be read exactly, the chart so the shape is obvious. Every
     # one answers a question someone actually asks -- see analyze.distributions.
+    # Five charts. Each one is on the dashboard because no sheet answers its
+    # question as quickly; everything else that used to be here duplicated a
+    # sheet that does it better, so it went.
     sections = [
-        ("Shipments by status", ("Status", "Shipments (BLs)"), dist["bl_by_status"],
+        ("Shipments by status", ("Status", "Shipments"), dist["bl_by_status"],
          "pie", "How many consignments are moving, waiting or finished?"),
-        ("Shipments by carrier", ("Carrier", "Shipments (BLs)"), dist["bl_by_carrier"],
-         "col", "Who is carrying our cargo, and how exposed are we to one line?"),
-        ("Containers per shipment", ("Containers on the BL", "Shipments"),
-         dist["bl_by_size"], "col",
-         "How much cargo rides on a single bill of lading?"),
-        ("Containers by status", ("Status", "Containers"), dist["by_status"],
-         "pie", "And the same picture counted in boxes rather than consignments."),
-        ("Where cargo is sitting now (top %d)" % analyze.TOP_N,
-         ("Last confirmed location", "Containers"), dist["by_location"],
-         "hbar", "Which ports and yards is our cargo piling up in?"),
-        ("Vessel exposure (top %d)" % analyze.TOP_N, ("Vessel", "Containers"),
-         dist["by_vessel"], "hbar",
-         "If one sailing is delayed, how many containers does it hit?"),
-        ("Inbound destinations (top %d)" % analyze.TOP_N,
-         ("Destination", "Containers"), dist["by_destination"], "hbar",
-         "Which delivery markets are affected?"),
-        ("Confirmed events per day (last %d days)" % analyze.ACTIVITY_CHART_DAYS,
-         ("Date", "Confirmed events"), dist["activity"], "line",
-         "Is tracking data still arriving, or has the feed gone quiet?"),
-        ("Open findings by category", ("Finding", "Rows"), dist["by_exception"],
-         "hbar", "What kind of problem dominates the Exceptions sheet?"),
+        ("Containers by company", ("Company", "Containers"),
+         dist["containers_by_company"], "col",
+         "Which of our companies has cargo on the water?"),
+        ("Where cargo is sitting now", ("Location", "Containers"),
+         dist["by_location"], "hbar",
+         "Where is our cargo physically piling up?"),
+        ("Where time is lost (median dwell, days)",
+         ("Location", "Median days"), dist["by_dwell"], "hbar",
+         "Which port or hub holds cargo longest?"),
+        ("What needs doing", ("Action", "Shipments"), dist["by_exception"],
+         "hbar", "What kind of problem dominates the action list?"),
     ]
-
     for heading, headers, table_rows, kind, question in sections:
+        # A section with nothing in it is not informative -- the company
+        # breakdown is empty when the file covers a single company, and a bare
+        # heading over an empty table just makes the dashboard longer.
+        if not table_rows:
+            continue
         note = ws.cell(row=row, column=1, value=question)
         note.font = TILE_NOTE_FONT
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span)
@@ -484,152 +484,163 @@ def _dashboard(wb, data, kpi: dict, dist: dict, available: list[str]) -> None:
 # --------------------------------------------------------------------------- #
 
 BL_COLUMNS = [
+    Column("Company", "company", 11),
+    Column("BL / Tracking No.", "bl", 18),
+    Column("Carrier", "carrier", 12),
+    Column("Boxes", "containers", 7, INT_FMT),
+    Column("Status", "status", 11),
+    Column("Attention", "attention", 10),
+    Column("What Needs Doing", "needs", 38),
+    Column("Last Confirmed Move", "confirmed_status", 24),
+    Column("Moved On", "latest_move", 12, DATE_FMT),
+    Column("Where It Is Now", "location", 22),
+    Column("Vessel", "vessel", 18),
+    Column("Carrier ETA", "eta", 12, DATE_FMT),
+    Column("Days To ETA", "days_to_eta", 9, INT_FMT),
+    Column("Next Expected", "next_event", 22),
+    Column("Free Days Left", "free_days_left", 9, INT_FMT),
+    Column("Boxes Not With The Rest", "outliers", 28),
+    Column("Destination", "destination", 18),
+    Column("Commodity", "commodity", 20),
+]
+
+ARRIVAL_COLUMNS = [
+    Column("Window", "arrival_window", 15),
+    Column("Arrival Date", "arrival_date", 13, DATE_FMT),
+    Column("Days Away", "days_away", 10, INT_FMT),
+    Column("Basis", "arrival_basis", 30),
+    Column("Company", "company", 12),
     Column("BL / Tracking No.", "bl", 18),
     Column("Carrier", "carrier", 13),
-    Column("Containers", "containers", 9, INT_FMT),
+    Column("Containers", "containers", 10, INT_FMT),
+    Column("Arrival Port", "arrival_port", 22),
+    Column("Documents", "docs_ready", 11),
+    Column("Document Position (sheet)", "document_position", 26),
+    Column("Free Time Expires", "free_time_expiry", 14, DATE_FMT),
+    Column("Free Days Left", "free_days_left", 11, INT_FMT),
+    Column("Commodity", "commodity", 22),
+    Column("Qty (mt)", "qty", 10, MONEY_FMT),
+    Column("Beneficiary", "beneficiary", 26),
     Column("Status", "status", 12),
     Column("Attention", "attention", 11),
-    Column("Split?", "split", 8),
-    Column("Containers Not With The Rest", "outliers", 30),
-    Column("Confirmed Status (normalised)", "confirmed_status", 26),
-    Column("Carrier Wording (original)", "carrier_wording", 26),
-    Column("Location", "location", 24),
     Column("Vessel", "vessel", 18),
-    Column("Voyage", "voyage", 10),
-    Column("Latest Confirmed Move", "latest_move", 18, DATETIME_FMT),
-    Column("Boxes Spread Over (days)", "move_spread_days", 11, INT_FMT),
-    Column("Idle Days When Last Checked", "idle_days", 12, INT_FMT),
-    Column("Next Expected Event", "next_event", 24),
-    Column("Next Expected Date", "next_event_dt", 16, DATE_FMT),
-    Column("Carrier ETA", "eta", 14, DATE_FMT),
-    Column("Days To ETA", "days_to_eta", 10, INT_FMT),
-    Column("ETA Slip (days)", "eta_slip_days", 11, INT_FMT),
-    Column("ETA Spread (days)", "eta_spread_days", 11, INT_FMT),
-    Column("Beneficiary", "beneficiary", 28),
-    Column("Commodity", "commodity", 22),
-    Column("Broker", "broker", 14),
-    Column("Sheet ETA", "sheet_eta", 13, DATE_FMT),
-    Column("ETA vs Sheet (days)", "eta_variance_days", 12, INT_FMT),
-    Column("Amount", "amount", 14, MONEY_FMT),
-    Column("Origin", "origin", 20),
     Column("Destination", "destination", 20),
-    Column("Port of Load", "port_of_load", 16),
-    Column("Port of Discharge", "port_of_discharge", 16),
-    Column("Transshipments", "transshipments", 34),
+]
+
+FREETIME_COLUMNS = [
+    Column("Free Time Status", "free_time_status", 32),
+    Column("Company", "company", 11),
+    Column("BL / Tracking No.", "bl", 18),
+    Column("Boxes On BL", "containers", 9, INT_FMT),
+    Column("Still At Port", "containers_at_port", 9, INT_FMT),
+    Column("Destination Port", "port_arrival_location", 20),
+    Column("Discharged On", "port_arrival_dt", 12, DATE_FMT),
+    Column("Free Days", "free_days", 8, INT_FMT),
+    Column("Expires", "free_time_expiry", 12, DATE_FMT),
+    Column("Days Left", "free_days_left", 8, INT_FMT),
+    Column("Documents", "docs_ready", 10),
+    Column("How the expiry was worked out", "free_time_basis", 48),
+]
+
+COMPANY_COLUMNS = [
+    Column("Company", "company", 15),
+    Column("Shipments", "shipments", 10, INT_FMT),
+    Column("Containers", "containers", 10, INT_FMT),
     Column("In Transit", "in_transit", 9, INT_FMT),
-    Column("Delivered", "delivered_count", 9, INT_FMT),
-    Column("Events", "events", 8, INT_FMT),
-    Column("Open Findings", "issue_count", 10, INT_FMT),
-    Column("Tracking Data Age (days)", "snapshot_age_days", 12, INT_FMT),
-    Column("Container Numbers", "container_list", 60),
+    Column("Delivered", "delivered", 9, INT_FMT),
+    Column("At Port", "at_port", 8, INT_FMT),
+    Column("Free Time At Risk", "free_time_at_risk", 11, INT_FMT),
+    Column("Documents Pending", "docs_pending", 11, INT_FMT),
+    Column("Needs Attention", "needs_attention", 11, INT_FMT),
+    Column("Carriers", "carriers", 24),
+]
+
+PORT_COLUMNS = [
+    Column("Location", "location", 24),
+    Column("Kind", "kind", 18),
+    Column("Containers Here Now", "here_now", 12, INT_FMT),
+    Column("Longest Box Here (days)", "longest_now", 12, INT_FMT),
+    Column("Median Dwell (days)", "median_dwell", 12, DEC_FMT),
+    Column("Shortest", "min_dwell", 9, INT_FMT),
+    Column("Longest", "max_dwell", 9, INT_FMT),
+    Column("Dwells Measured", "measured", 11, INT_FMT),
+    Column("Containers Seen", "containers", 11, INT_FMT),
+    Column("Companies", "companies", 22),
+]
+
+LANE_COLUMNS = [
+    Column("Lane", "lane", 40),
+    Column("Completed Journeys", "journeys", 12, INT_FMT),
+    Column("Median Transit (days)", "median", 13, DEC_FMT),
+    Column("Fastest", "fastest", 9, INT_FMT),
+    Column("Slowest", "slowest", 9, INT_FMT),
+    Column("Median Ocean (days)", "median_ocean", 13, DEC_FMT),
+    Column("Median Port Dwell (days)", "median_port_dwell", 13, DEC_FMT),
+    Column("Usable As Benchmark", "usable", 12),
+    Column("Containers", "containers", 11, INT_FMT),
+    Column("Carriers", "carriers", 26),
 ]
 
 CONTAINER_COLUMNS = [
-    Column("Container", "container_id", 15),
+    Column("Container", "container_id", 14),
     Column("BL / Tracking No.", "bl", 18),
-    Column("Carrier", "carrier_display", 13),
-    Column("Tracking No. / BL", "tracking_number_resolved", 18),
-    Column("Bill of Lading", "bill_of_lading", 16),
-    Column("Status", "status_bucket", 12),
-    Column("Attention", "attention", 11),
-    Column("Confirmed Status (normalised)", "last_actual_normalized", 26),
-    Column("Carrier Wording (original)", "last_actual_event", 26),
-    Column("Last Confirmed Move", "last_actual_dt", 18, DATETIME_FMT),
-    Column("Idle Days When Last Checked", "idle_at_snapshot_days", 12, INT_FMT),
-    Column("Days Since Last Move (today)", "days_since_last_move", 12, INT_FMT),
-    Column("Last Confirmed Location", "last_actual_location", 24),
+    Column("Carrier", "carrier_display", 12),
+    Column("Status", "status_bucket", 11),
+    Column("Attention", "attention", 10),
+    Column("Last Confirmed Move", "last_actual_normalized", 24),
+    Column("Moved On", "last_actual_dt", 12, DATE_FMT),
+    Column("Where It Is Now", "last_actual_location", 22),
     Column("Vessel", "vessel", 18),
-    Column("Voyage", "voyage", 10),
-    Column("Next Expected Event", "next_event_normalized", 24),
-    Column("Next Expected Date", "next_event_dt", 16, DATE_FMT),
-    Column("Next Expected Location", "next_event_location", 22),
-    Column("Carrier ETA", "eta_dt", 16, DATE_FMT),
-    Column("Days To ETA", "days_to_eta", 10, INT_FMT),
-    Column("ETA Slip (days)", "eta_slip_days", 11, INT_FMT),
-    Column("First ETA Seen", "first_eta_dt", 14, DATE_FMT),
-    Column("Origin", "origin", 20),
-    Column("Destination", "destination", 20),
-    Column("Port of Load", "port_of_load", 16),
-    Column("Port of Discharge", "port_of_discharge", 16),
-    Column("Transshipments", "transshipments", 34),
-    Column("Container Type", "container_type", 15),
-    Column("Events", "events_on_report", 8, INT_FMT),
-    Column("Confirmed Events", "actual_events", 10, INT_FMT),
-    Column("Transit Days So Far", "transit_days_so_far", 11, INT_FMT),
-    Column("Open Findings", "issue_count", 10, INT_FMT),
-    Column("Tracking Data Age (days)", "snapshot_age_days", 12, INT_FMT),
-    Column("Tracked At", "snapshot_dt", 18, DATETIME_FMT),
-    Column("Run ID", "run_id", 14),
+    Column("Carrier ETA", "eta_dt", 12, DATE_FMT),
+    Column("Idle Days", "idle_at_snapshot_days", 9, INT_FMT),
+    Column("Type", "container_type", 13),
+    Column("Events", "events_on_report", 7, INT_FMT),
 ]
 
 EVENT_COLUMNS = [
-    Column("Container", "container_id", 15),
-    Column("Carrier", "carrier_display", 13),
-    Column("Tracking No. / BL", "tracking_number", 18),
-    Column("Seq", "sequence", 6, INT_FMT),
-    Column("Event Date/Time", "event_dt", 18, DATETIME_FMT),
+    Column("Container", "container_id", 14),
+    Column("BL / Tracking No.", "tracking_number", 18),
+    Column("Carrier", "carrier_display", 12),
+    Column("Date", "event_dt", 16, DATETIME_FMT),
     Column("Basis", "time_basis", 10),
-    Column("Carrier Event (original)", "description", 28),
-    Column("Normalised Status", "normalized_status", 26),
-    Column("Milestone Code", "milestone", 24),
-    Column("Journey Phase", "phase", 14),
-    Column("Tracker Status", "status", 12),
-    Column("Location", "location", 24),
-    Column("UN/LOCODE", "unlocode", 11),
-    Column("Terminal", "terminal", 30),
-    Column("Mode", "mode", 9),
+    Column("Carrier Event (original)", "description", 26),
+    Column("Normalised Status", "normalized_status", 24),
+    Column("Journey Phase", "phase", 13),
+    Column("Location", "location", 22),
+    Column("Mode", "mode", 8),
     Column("Vessel", "vessel_name", 18),
-    Column("Voyage", "voyage", 10),
-    Column("Vessel IMO", "vessel_imo", 11),
-    Column("Vessel Flag", "vessel_flag", 13),
-    Column("Laden", "laden_status", 9),
-    Column("Mapping Source", "mapping_source", 12),
-    Column("Basis Reason", "time_basis_reason", 22),
-    Column("Run ID", "run_id", 14),
+    Column("Voyage", "voyage", 9),
 ]
 
 CARRIER_COLUMNS = [
-    Column("Carrier", "carrier", 16),
-    Column("Code", "code", 8),
-    Column("Target Carrier", "in_target_eight", 11),
-    Column("Tracking Adapter", "adapter", 20),
-    Column("Coverage", "coverage", 26),
-    Column("Containers", "containers", 11, INT_FMT),
-    Column("In Transit", "in_transit", 10, INT_FMT),
-    Column("At Origin", "at_origin", 10, INT_FMT),
-    Column("Delivered", "delivered", 10, INT_FMT),
-    Column("No Events", "no_events", 10, INT_FMT),
-    Column("Delayed (ETA slipped)", "delayed", 12, INT_FMT),
-    Column("Avg ETA Slip (days)", "avg_eta_slip", 12, DEC_FMT),
-    Column("No Movement 7d+", "stale", 12, INT_FMT),
-    Column("Missing ETA", "missing_eta", 11, INT_FMT),
-    Column("With Forward Schedule", "with_forecast", 13, INT_FMT),
-    Column("Needs Attention", "needs_attention", 12, INT_FMT),
-    Column("Events", "events", 10, INT_FMT),
-    Column("Avg Events / Container", "avg_events", 13, DEC_FMT),
-    Column("Avg Days Since Move", "avg_idle_days", 13, DEC_FMT),
-    Column("Tracking Failures", "failures", 11, INT_FMT),
+    Column("Carrier", "carrier", 15),
+    Column("Coverage", "coverage", 34),
+    Column("Containers", "containers", 10, INT_FMT),
+    Column("In Transit", "in_transit", 9, INT_FMT),
+    Column("Delivered", "delivered", 9, INT_FMT),
+    Column("Delayed", "delayed", 9, INT_FMT),
+    Column("Sitting Still", "stale", 9, INT_FMT),
+    Column("Missing ETA", "missing_eta", 10, INT_FMT),
+    Column("Needs Attention", "needs_attention", 11, INT_FMT),
+    Column("Tracking Failures", "failures", 10, INT_FMT),
+    Column("Events", "events", 9, INT_FMT),
 ]
 
 EXCEPTION_COLUMNS = [
-    Column("Severity", "severity", 11),
-    Column("Class", "class", 11),
-    Column("Finding", "category", 26),
+    Column("Severity", "severity", 10),
+    Column("What Needs Doing", "category", 32),
+    Column("Company", "company", 11),
     Column("BL / Tracking No.", "bl", 18),
-    Column("Scope", "scope", 18),
-    Column("Containers Affected", "containers", 34),
-    Column("Carrier", "carrier", 13),
-    Column("Status", "status", 12),
-    Column("Value", "value", 9, INT_FMT),
-    Column("What it means / what to do", "detail", 62),
-    Column("Evidence (source field)", "evidence", 30),
-    Column("Last Confirmed Move", "last_move", 18, DATETIME_FMT),
-    Column("Location", "location", 22),
-    Column("Carrier ETA", "eta", 14, DATE_FMT),
-    Column("Destination", "destination", 20),
+    Column("Scope", "scope", 17),
+    Column("Boxes Affected", "containers", 28),
+    Column("Detail", "detail", 72),
+    Column("Where It Is Now", "location", 20),
+    Column("Carrier ETA", "eta", 12, DATE_FMT),
+    Column("Evidence (source field)", "evidence", 28),
 ]
 
 SHIPMENT_COLUMNS = [
+    Column("Company", "company", 12),
     Column("Sheet Row", "row_number", 9, INT_FMT),
     Column("Bill of Lading", "bl_number", 20),
     Column("Carrier", "carrier_display", 14),
@@ -641,10 +652,18 @@ SHIPMENT_COLUMNS = [
     Column("Amount", "amount", 14, MONEY_FMT),
     Column("Delivery Terms", "delivery_terms", 18),
     Column("Free Days", "free_days", 9, INT_FMT),
-    Column("Sheet ETA", "sheet_eta_dt", 13, DATE_FMT),
-    Column("Sheet ETA Place", "sheet_eta_place", 15),
+    Column("Sheet ETA text (NOT USED)", "sheet_eta_raw", 18),
+    Column("Sheet Port ETA text (NOT USED)", "eta_port_raw", 20),
+    Column("Free Time text", "free_time_raw", 14),
+    Column("Origin", "origin", 16),
+    Column("Port of Loading", "port_of_loading", 16),
+    Column("Rate", "rate", 10, MONEY_FMT),
+    Column("Value (qty x rate)", "amount_derived", 14, MONEY_FMT),
+    Column("Containers On Sheet", "sheet_container_count", 11, INT_FMT),
+    Column("Container Size", "container_size", 12),
+    Column("Document Position", "document_position", 26),
+    Column("LC No.", "lc_no", 20),
     Column("Carrier ETA", "tracked_eta_dt", 13, DATE_FMT),
-    Column("ETA Variance (days)", "eta_variance_days", 12, INT_FMT),
     Column("Tracked Status", "tracked_status", 14),
     Column("Tracked Location", "tracked_location", 22),
     Column("Containers", "container_count", 10, INT_FMT),
@@ -758,12 +777,16 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
     wb = Workbook()
     wb.remove(wb.active)
 
-    available = [S_BLS, S_CONTAINERS, S_EVENTS, S_CARRIERS, S_EXCEPTIONS]
-    if data.shipments:
-        available.append(S_SHIPMENTS)
+    available = [S_BLS, S_EXCEPTIONS, S_CONTAINERS, S_EVENTS, S_FREETIME,
+                 S_COMPANIES, S_CARRIERS, S_PORTS, S_LANES]
     if data.errors:
         available.append(S_FAILURES)
-    available += [S_QUALITY, S_STATUS_MAP, S_CARRIER_MAP, S_RUNS]
+    available.append(S_QUALITY)
+    if not data.shipments:
+        # Free time needs the commercial sheet's free-days count. Without
+        # shipments.json there is nothing to put on it, so it is omitted rather
+        # than shown empty.
+        available = [name for name in available if name != S_FREETIME]
 
     _dashboard(wb, data, kpi, dist, available)
 
@@ -776,53 +799,92 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
         "BL normally travel as one consignment -- this row is that consignment, "
         "and any container that is NOT with the rest is named."
         % (len(data.shipment_rows), len(data.containers)),
-        BL_COLUMNS, data.shipment_rows, "tblBLs",
+        BL_COLUMNS, analyze.sort_shipments(data.shipment_rows), "tblBLs",
         legend=[
-            "Status, Location, Vessel and ETA are the CONSENSUS across the BL's "
-            "containers -- the value most of them share, not the first or the "
-            "worst. On a 13-box BL where 12 are delivered and 1 is still in "
-            "transit, the shipment reads Delivered and the straggler is named.",
-            "Split? = Yes means at least one container differs from the rest on "
-            "status, milestone, location or vessel. That is the case worth "
-            "checking by hand: a box damaged, rolled to a later vessel, or held. "
-            "Containers Not With The Rest names them.",
-            "Boxes Spread Over (days) is how far apart the containers last "
-            "moved. Zero or one day is normal -- a terminal scanning a stack "
-            "takes minutes. Amber from %d days, red from %d, because whole days "
-            "apart means part of the consignment did not travel."
-            % (analyze.CONTAINER_SPREAD_WARN_DAYS,
-               analyze.CONTAINER_SPREAD_CRITICAL_DAYS),
-            "ETA Spread (days) is the same idea for arrival dates. Carriers "
-            "issue a per-container delivery date, so a day or two apart is "
-            "normal and only %d+ days counts as the consignment splitting "
-            "across arrivals." % analyze.ETA_SPREAD_WARN_DAYS,
-            "Beneficiary, Commodity, Broker and Amount are joined from the "
-            "commercial sheet where that BL appears on it. Blank is normal for "
-            "a container-number lookup, which has no sheet row behind it.",
-            "A BL with one container is a single-container lookup, not a "
-            "consignment -- Split? is always No and the spread columns are blank.",
+            "Sorted worst first, then soonest arriving. What Needs Doing is the "
+            "short version of why a row is flagged; Action Required has the full "
+            "detail and the box numbers.",
+            "Status, Where It Is Now, Vessel and Carrier ETA are the CONSENSUS "
+            "across the BL's containers -- the value most of them share. On a "
+            "13-box BL where 12 are delivered and one is still in transit, the "
+            "shipment reads Delivered and the straggler is named under Boxes Not "
+            "With The Rest.",
+            "Every date here comes from the carrier. The commercial sheet's own "
+            "ETA columns are typed by hand and are not used anywhere in this "
+            "workbook.",
+            "Free Days Left is carrier discharge + the free-days count from the "
+            "sheet, counted only while boxes are still at the port. Blank means "
+            "nothing is ashore yet, or the sheet states no free days.",
+            "Drill down on Container Summary for the individual boxes, or Event "
+            "History for the full movement record.",
         ])
     _severity_rules(ws, _letter(BL_COLUMNS, "attention"), first, last)
-    _severity_rules(ws, _letter(BL_COLUMNS, "split"), first, last,
-                    critical=("Yes",), warning=(), good=("No",))
     _severity_rules(ws, _letter(BL_COLUMNS, "status"), first, last,
                     critical=("No Events",), warning=("At Origin",),
                     good=("Delivered",))
-    _threshold_rules(ws, _letter(BL_COLUMNS, "move_spread_days"), first, last,
-                     analyze.CONTAINER_SPREAD_WARN_DAYS,
-                     analyze.CONTAINER_SPREAD_CRITICAL_DAYS)
-    _threshold_rules(ws, _letter(BL_COLUMNS, "eta_spread_days"), first, last,
-                     analyze.ETA_SPREAD_WARN_DAYS, analyze.ETA_SPREAD_WARN_DAYS * 3)
-    _threshold_rules(ws, _letter(BL_COLUMNS, "idle_days"), first, last,
-                     analyze.STALE_WARN_DAYS, analyze.STALE_CRITICAL_DAYS)
-    _threshold_rules(ws, _letter(BL_COLUMNS, "eta_slip_days"), first, last,
-                     analyze.ETA_SLIP_WARN_DAYS, analyze.ETA_SLIP_CRITICAL_DAYS)
-    if last >= first:
+    left = _letter(BL_COLUMNS, "free_days_left")
+    if left and last >= first:
         ws.conditional_formatting.add(
-            "%s%d:%s%d" % (_letter(BL_COLUMNS, "containers"), first,
-                           _letter(BL_COLUMNS, "containers"), last),
-            ColorScaleRule(start_type="min", start_color="FFFFFF",
-                           end_type="max", end_color=BLUE))
+            "%s%d:%s%d" % (left, first, left, last),
+            CellIsRule(operator="lessThanOrEqual",
+                       formula=[str(analyze.FREE_TIME_CRITICAL_DAYS)],
+                       fill=RED_FILL, font=RED_FONT, stopIfTrue=True))
+        ws.conditional_formatting.add(
+            "%s%d:%s%d" % (left, first, left, last),
+            CellIsRule(operator="lessThanOrEqual",
+                       formula=[str(analyze.FREE_TIME_WARN_DAYS)],
+                       fill=AMBER_FILL, font=AMBER_FONT))
+    eta = _letter(BL_COLUMNS, "days_to_eta")
+    if eta and last >= first:
+        ws.conditional_formatting.add(
+            "%s%d:%s%d" % (eta, first, eta, last),
+            CellIsRule(operator="lessThan", formula=["0"],
+                       fill=RED_FILL, font=RED_FONT))
+
+    # --- Free Time & Detention ---------------------------------------------- #
+    if data.shipments:
+        free_time = analyze.free_time_rows(data)
+        ws, first, last = _sheet(
+            wb, S_FREETIME, "Free Time & Detention Exposure",
+            "The largest avoidable cost in this data. %d shipment(s) with cargo "
+            "ashore or due. Worst first." % len(free_time),
+            FREETIME_COLUMNS, free_time, "tblFreeTime",
+            legend=[
+                "Free time expires = discharge at the DESTINATION port (a "
+                "CARRIER event) + the free days on the commercial sheet. The "
+                "free days are a day COUNT -- a contractual term, not a typed "
+                "date -- which is why they are still used when the sheet's date "
+                "columns are not. Where the FREE TIME cell holds a date instead "
+                "of a count, no expiry is claimed: that date is not trusted.",
+                "Only containers STILL AT PORT are exposed. A BL whose free time "
+                "ran out weeks ago but whose boxes all railed out owes nothing -- "
+                "Free Time Status leads with the count still on the ground rather "
+                "than with a signed number that cannot tell those apart.",
+                "A transshipment discharge does NOT start the clock. Colombo and "
+                "Tanjung Pelepas are hubs on these routes: the box is between "
+                "vessels and was never available for collection. Only a discharge "
+                "with no onward sea leg counts.",
+                "Blank expiry with cargo ashore means the sheet's FREE TIME cell "
+                "is empty, or holds a date rather than a day count. Detention may "
+                "already be running and the report cannot tell -- that is a "
+                "finding on the Exceptions sheet, not a reassurance.",
+            ])
+        status = _letter(FREETIME_COLUMNS, "free_time_status")
+        if last >= first:
+            span = "%s%d:%s%d" % (status, first, status, last)
+            for text, fill, font in (("EXPIRED", RED_FILL, RED_FONT),
+                                     ("Expires in", AMBER_FILL, AMBER_FONT),
+                                     ("Cleared", GREEN_FILL, GREEN_FONT),
+                                     ("Not yet ashore", GREEN_FILL, GREEN_FONT)):
+                ws.conditional_formatting.add(span, CellIsRule(
+                    operator="containsText", formula=[
+                        'NOT(ISERROR(SEARCH("%s",%s%d)))' % (text, status, first)],
+                    fill=fill, font=font))
+            _threshold_rules(ws, _letter(FREETIME_COLUMNS, "max_port_dwell_days"),
+                             first, last, 7, 14)
+        _severity_rules(ws, _letter(FREETIME_COLUMNS, "docs_ready"), first, last,
+                        critical=("Pending",), warning=("Not stated",),
+                        good=("Ready",))
 
     # --- Container Summary -------------------------------------------------- #
     ws, first, last = _sheet(
@@ -858,17 +920,9 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
     _severity_rules(ws, _letter(CONTAINER_COLUMNS, "status_bucket"), first, last,
                     critical=("No Events",), warning=("At Origin",),
                     good=("Delivered",))
-    slip = _letter(CONTAINER_COLUMNS, "eta_slip_days")
-    if last >= first:
-        _threshold_rules(ws, slip, first, last,
-                         analyze.ETA_SLIP_WARN_DAYS, analyze.ETA_SLIP_CRITICAL_DAYS)
-        ws.conditional_formatting.add(
-            "%s%d:%s%d" % (slip, first, slip, last),
-            CellIsRule(operator="lessThan", formula=["0"],
-                       fill=GREEN_FILL, font=GREEN_FONT))
-        age = _letter(CONTAINER_COLUMNS, "snapshot_age_days")
-        _threshold_rules(ws, age, first, last,
-                         analyze.SNAPSHOT_STALE_DAYS, analyze.SNAPSHOT_STALE_DAYS * 2)
+    # ETA slip and snapshot age used to be coloured here too. Both are gone from
+    # this sheet: slip belongs to the consignment, not the box, and snapshot age
+    # is a fact about the pipeline that now lives on Data Quality.
 
     # --- Event History ------------------------------------------------------ #
     ws, first, last = _sheet(
@@ -896,6 +950,33 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
                     critical=("unmapped", "blank"), warning=("keyword",),
                     good=("exact",))
 
+    # --- Company Summary ---------------------------------------------------- #
+    companies = analyze.company_summary(data)
+    ws, first, last = _sheet(
+        wb, S_COMPANIES, "Company Summary",
+        "One row per company. Companies come from the master workbook's sheet "
+        "names, so a new company tab appears here automatically.",
+        COMPANY_COLUMNS, companies, "tblCompanies",
+        legend=[
+            "Cargo Value is quantity x rate from the commercial sheet. The sheet "
+            "states a RATE per tonne, not a total, so this is derived -- treat it "
+            "as an indication of exposure, not an invoice figure.",
+            "Median Transit (days) counts only journeys that have COMPLETED, so "
+            "it is blank for a company whose cargo is all still moving.",
+            "'(not stated)' is cargo tracked from the older single-sheet workbook "
+            "or from a container-number list, neither of which names a company.",
+        ])
+    _threshold_rules(ws, _letter(COMPANY_COLUMNS, "free_time_at_risk"),
+                     first, last, 1, 3)
+    _threshold_rules(ws, _letter(COMPANY_COLUMNS, "docs_pending"), first, last, 1, 3)
+    _threshold_rules(ws, _letter(COMPANY_COLUMNS, "split"), first, last, 1, 2)
+    if last >= first:
+        ws.conditional_formatting.add(
+            "%s%d:%s%d" % (_letter(COMPANY_COLUMNS, "containers"), first,
+                           _letter(COMPANY_COLUMNS, "containers"), last),
+            ColorScaleRule(start_type="min", start_color="FFFFFF",
+                           end_type="max", end_color=BLUE))
+
     # --- Carrier Summary ---------------------------------------------------- #
     ws, first, last = _sheet(
         wb, S_CARRIERS, "Carrier Summary",
@@ -919,6 +1000,61 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
             ColorScaleRule(start_type="min", start_color="FFFFFF",
                            end_type="max", end_color=BLUE))
         _threshold_rules(ws, _letter(CARRIER_COLUMNS, "failures"), first, last, 1, 5)
+
+    # --- Ports & Hubs ------------------------------------------------------- #
+    ports = analyze.port_rows(data)
+    ws, first, last = _sheet(
+        wb, S_PORTS, "Ports & Transshipment Hubs",
+        "Where the time goes. Slowest median dwell first, measured from this "
+        "operation's own event history.",
+        PORT_COLUMNS, ports, "tblPorts",
+        legend=[
+            "Kind is the important distinction. At a DESTINATION PORT the box is "
+            "ashore and collectable, so free time runs and detention can be "
+            "charged. At a TRANSSHIPMENT HUB it is between vessels and cannot be "
+            "collected -- real delay, but no detention.",
+            "Median Dwell is measured over completed waits only. Containers Here "
+            "Now and Longest Box Here (days) describe what is sitting there at "
+            "this moment, and those waits are still growing.",
+            "A hub with a high median is where to push the carrier on routing; a "
+            "destination port with a high median is where to push your own "
+            "clearance and haulage.",
+        ])
+    _severity_rules(ws, _letter(PORT_COLUMNS, "kind"), first, last,
+                    critical=(), warning=("Transshipment hub",),
+                    good=("Destination port",))
+    _threshold_rules(ws, _letter(PORT_COLUMNS, "median_dwell"), first, last, 7, 10)
+    _threshold_rules(ws, _letter(PORT_COLUMNS, "longest_now"), first, last, 7, 14)
+
+    # --- Lane Performance --------------------------------------------------- #
+    lanes = analyze.lane_rows(data)
+    ws, first, last = _sheet(
+        wb, S_LANES, "Lane Performance",
+        "How long each route actually takes, from completed journeys only. "
+        "%d lane(s) measured." % len(lanes),
+        LANE_COLUMNS, lanes, "tblLanes",
+        legend=[
+            "Median Transit is origin gate-in to arrival at destination, measured "
+            "from this operation's OWN completed journeys -- so it already "
+            "includes the transshipment waits and rail legs these routes really "
+            "involve, not a carrier's published port-to-port time.",
+            "Usable As Benchmark is True only at %d or more completed journeys. "
+            "Below that the median is a sample, and no shipment is flagged slow "
+            "against it." % analyze.LANE_MIN_JOURNEYS,
+            "A shipment is called slow only when it exceeds its own lane's median "
+            "by %d%% or more. That finding is on the Exceptions sheet."
+            % int((analyze.LANE_SLOW_FACTOR - 1) * 100),
+            "A lane with no completed journeys yet does not appear. It will once "
+            "cargo finishes -- the history is what makes this sheet work.",
+        ])
+    _severity_rules(ws, _letter(LANE_COLUMNS, "usable"), first, last,
+                    critical=(), warning=("False",), good=("True",))
+    if last >= first:
+        median = _letter(LANE_COLUMNS, "median")
+        ws.conditional_formatting.add(
+            "%s%d:%s%d" % (median, first, median, last),
+            ColorScaleRule(start_type="min", start_color="C6EFCE",
+                           end_type="max", end_color="FFC7CE"))
 
     # --- Exceptions --------------------------------------------------------- #
     ws, first, last = _sheet(
@@ -946,31 +1082,6 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
                     critical=("Critical",), warning=("Warning",), good=())
     _severity_rules(ws, _letter(EXCEPTION_COLUMNS, "class"), first, last,
                     critical=(), warning=("Shipment",), good=("Data",))
-
-    # --- Commercial Shipments ----------------------------------------------- #
-    if data.shipments:
-        ws, first, last = _sheet(
-            wb, S_SHIPMENTS, "Commercial Shipments",
-            "One row per commercial sheet line, joined to tracking on the bill of "
-            "lading. %d row(s)." % len(data.shipments),
-            SHIPMENT_COLUMNS, data.shipments, "tblShipments",
-            legend=[
-                "ETA Variance (days) is the carrier's ETA minus the ETA typed on "
-                "the commercial sheet. Positive = the carrier is later than the "
-                "commercial team expected.",
-                "A row blank from Carrier ETA onwards was never tracked. Check "
-                "Tracking Failures: an unsupported carrier or inland cargo will "
-                "sit here permanently and is not a fault.",
-                "shipments.json carries no run_id, so rows were collapsed to the "
-                "last version of each sheet row. See Data Quality.",
-            ])
-        variance = _letter(SHIPMENT_COLUMNS, "eta_variance_days")
-        if last >= first:
-            _threshold_rules(ws, variance, first, last, 1, 7)
-            ws.conditional_formatting.add(
-                "%s%d:%s%d" % (variance, first, variance, last),
-                CellIsRule(operator="lessThan", formula=["0"],
-                           fill=GREEN_FILL, font=GREEN_FONT))
 
     # --- Tracking Failures -------------------------------------------------- #
     if data.errors:
@@ -1032,7 +1143,7 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
            "Every (carrier, event wording) pair in the data and what it "
            "normalises to. Original wording is never replaced -- only "
            "supplemented.",
-           STATUS_MAP_COLUMNS, analyze.status_mapping_rows(data), "tblStatusMap",
+           STATUS_MAP_COLUMNS, analyze.status_mapping_rows(data), "tblStatusMap", hidden=True,
            legend=[
                "Mapping Source 'exact' means a confirmed mapping in "
                "reporting/normalize.py EXACT_EVENT_MAP.",
@@ -1052,7 +1163,7 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
     _sheet(wb, S_CARRIER_MAP, "Carrier Mapping",
            "The eight carriers this reporting system supports, plus anything else "
            "found in the data, with the coverage the tracker actually has today.",
-           CARRIER_MAP_COLUMNS, analyze.carrier_mapping_rows(data), "tblCarrierMap",
+           CARRIER_MAP_COLUMNS, analyze.carrier_mapping_rows(data), "tblCarrierMap", hidden=True,
            legend=[
                "'not built' in Tracking Adapter means the tracking application has "
                "no way to fetch that carrier. The reporting layer will handle its "
@@ -1064,7 +1175,7 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
     _sheet(wb, S_RUNS, "Run History",
            "Every tracking run present in the JSON. The report uses the latest row "
            "per container, so older runs are here for context and audit.",
-           RUN_COLUMNS, data.runs, "tblRuns",
+           RUN_COLUMNS, data.runs, "tblRuns", hidden=True,
            legend=[
                "Schema v1 rows were written by pipeline.flatten (via "
                "maersk_browser.py or maersk_burst.py) and predate the "
@@ -1073,6 +1184,10 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
                "That is what makes ETA-slip detection possible.",
            ])
 
+    _raw_sheet(wb, S_RAW_SHIPMENTS, data.raw_shipments, "tblRawShipments",
+               "Every commercial sheet row as read from shipments.json, "
+               "unmodified -- including the columns the report does not use and "
+               "the rows with no BL. Hidden by default; unhide to audit.")
     _raw_sheet(wb, S_RAW_CONTAINERS, data.raw_containers, "tblRawContainers",
                "Every container row as read from containers.json, all runs, "
                "unmodified. Hidden by default; unhide to audit any figure.")
@@ -1084,3 +1199,57 @@ def build(data, kpi: dict, dist: dict, carriers: list[dict],
     output.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
     return output
+
+
+# --------------------------------------------------------------------------- #
+# self-check
+# --------------------------------------------------------------------------- #
+
+def _assert_columns_unique() -> None:
+    """Every sheet's headers and keys must be unique.
+
+    A duplicate header makes the Excel table invalid and Excel offers to repair
+    the file; a duplicate key silently writes the same value into two columns.
+    Both are easy to introduce when adding a column to a long list, and neither
+    is obvious by eye -- this ran at import and caught a second
+    "Free Time Expires" on BL Summary immediately.
+    """
+    sheets = {
+        "BL Summary": BL_COLUMNS,
+        "Arrivals Planner": ARRIVAL_COLUMNS,
+        "Free Time & Detention": FREETIME_COLUMNS,
+        "Company Summary": COMPANY_COLUMNS,
+        "Ports & Hubs": PORT_COLUMNS,
+        "Lane Performance": LANE_COLUMNS,
+        "Container Summary": CONTAINER_COLUMNS,
+        "Event History": EVENT_COLUMNS,
+        "Carrier Summary": CARRIER_COLUMNS,
+        "Exceptions": EXCEPTION_COLUMNS,
+        "Commercial Shipments": SHIPMENT_COLUMNS,
+        "Tracking Failures": FAILURE_COLUMNS,
+        "Data Quality": QUALITY_COLUMNS,
+        "Reconciliation": RECONCILE_COLUMNS,
+        "Status Mapping": STATUS_MAP_COLUMNS,
+        "Carrier Mapping": CARRIER_MAP_COLUMNS,
+        "Run History": RUN_COLUMNS,
+    }
+    problems = []
+    for sheet, columns in sheets.items():
+        for label, values in (("header", [c.header for c in columns]),
+                              ("key", [c.key for c in columns])):
+            seen, repeated = set(), set()
+            for value in values:
+                if value in seen:
+                    repeated.add(value)
+                seen.add(value)
+            if repeated:
+                problems.append("%s has duplicate %s(s): %s"
+                                % (sheet, label, ", ".join(sorted(repeated))))
+            if any(not v for v in values):
+                problems.append("%s has an empty %s" % (sheet, label))
+    if problems:
+        raise AssertionError("Column definition problems:\n  "
+                             + "\n  ".join(problems))
+
+
+_assert_columns_unique()

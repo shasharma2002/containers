@@ -4,12 +4,12 @@ Tracks containers and bills of lading with the shipping lines, and turns the
 results into one Excel report you can send to the people who need it.
 
 ```
-bl_list.xlsx  ->  track_all.py  ->  containers.json / events.json
-(commercial sheet)                  errors.json / shipments.json
-                                             |
-                                    generate_report.py
-                                             |
-                             output/cargo_tracking_report.xlsx
+all_companies.xlsx  ->  track_all.py  ->  containers.json / events.json
+(one sheet per company)                   errors.json / shipments.json
+                                                   |
+                                          generate_report.py
+                                                   |
+                                   output/cargo_tracking_report.xlsx
 ```
 
 Two layers that do not depend on each other. The tracking layer talks to
@@ -32,8 +32,20 @@ Python 3.11 or newer.
 ## Daily use
 
 ```bash
-python track_all.py bl_list.xlsx --append     # fetch from the carriers
-python generate_report.py                     # build the Excel report
+python track_all.py all_companies.xlsx --append   # fetch from the carriers
+python generate_report.py                         # build the Excel report
+```
+
+**Two input formats, auto-detected.** `all_companies.xlsx` is the master
+workbook — one sheet per company, company taken from the tab name. The older
+single-sheet `bl_list.xlsx` still works unchanged. `track_all.py` decides which
+reader to use from the workbook's contents, not its filename, so nothing you
+already have scheduled breaks.
+
+To see what the master workbook parses to without tracking anything:
+
+```bash
+python read_master.py all_companies.xlsx --show-skipped
 ```
 
 `--append` matters. The reporting layer detects delays by comparing a
@@ -41,7 +53,11 @@ container's ETA between snapshots, so **the accumulated history IS the delay
 baseline**. A single run cannot show that a carrier moved its own date, and the
 report will correctly report zero delays until you have two or more runs.
 
-The report lands at `output/cargo_tracking_report.xlsx`. Close it in Excel
+The report lands at `output/cargo_tracking_report.xlsx`. Open **Shipments**
+first — one row per BL, worst first, with a *What Needs Doing* column. **Action
+Required** has the detail. Everything else is drill-down or analysis.
+
+ Close it in Excel
 before re-running, or the generator exits 2 and tells you so.
 
 ---
@@ -55,7 +71,8 @@ before re-running, or the generator exits 2 and tells you so.
 [track_all.py](track_all.py) | **Main entry point.** Batch tracker; two modes — commercial-sheet (by BL) and container-list |
 [pipeline.py](pipeline.py) | **The output schema.** `flatten()` and `write_json()`, imported by every entry point. Never copy these into a caller |
 [carrier_id.py](carrier_id.py) | BIC-prefix → carrier routing, and the Excel column sniffer |
-[read_sheet.py](read_sheet.py) | Parses the commercial "LC OPEN AND CARGO IN TRANSIT" workbook |
+[read_master.py](read_master.py) | **Parses the multi-company master workbook.** One sheet per company; classifies and skips non-company tabs |
+[read_sheet.py](read_sheet.py) | Parses the older single-sheet "LC OPEN AND CARGO IN TRANSIT" workbook |
 [msc_track.py](msc_track.py) | MSC adapter — plain HTTPS, `curl_cffi` TLS impersonation |
 [maersk_track.py](maersk_track.py) | Maersk `parse()`, used by every Maersk path. Its `fetch()` always 403s — see below |
 [maersk_browser.py](maersk_browser.py) | **The working Maersk path.** Playwright; lets Maersk's own JavaScript make the call |
@@ -84,7 +101,8 @@ there is no tracking JSON yet, so both suites pass on a clean checkout.
 
 | File | Role |
 |---|---|
-`bl_list.xlsx` | **Live input** — the commercial sheet `track_all.py` reads |
+`all_companies.xlsx` | **Live input** — the multi-company master workbook |
+`bl_list.xlsx` | Older single-sheet input. Still supported; kept as a fallback |
 `test_fixture_sheet.xlsx` | Small fixture for the sheet parser, used by `test_tracking.py` |
 [powerbi_setup.md](powerbi_setup.md) | Power BI model over the same JSON (DAX, relationships, caveats) |
 `.maersk-profile/` | Persistent Chromium profile for the browser path. Regenerable, but keeping it makes a bot challenge less likely — don't delete it as routine cleanup |
@@ -106,9 +124,41 @@ prefixes (`TCLU`, `CAIU`, `TLLU`, …) say nothing about the carrier, and this
 project's own data has leased boxes on MSC. `carrier_id.classify` returns a
 confidence level for exactly this reason; an "unknown" means search, not fail.
 
-**On the commercial sheet, `SHIPPING LINE` decides the carrier — not the BL
-prefix.** Maersk BLs on that sheet are bare 9-digit numbers with no prefix at
-all, so prefix classification cannot work on them however good the table is.
+**The master workbook has no `SHIPPING LINE` column.** `bl_list.xlsx` had one,
+and it was the only thing routing Maersk's bare-numeric BLs. The carrier now
+comes from the BL's own shape: `carrier_id.classify` returns a **medium**
+confidence Maersk hint for a bare 9–12 digit BL, because Maersk issues those
+while every other line prefixes theirs (`MEDU…`, `HLCU…`, `ONEY…`). Without that
+rule, 11 of the 23 live BLs were skipped as inland cargo without a lookup ever
+being attempted. Medium, not high — it is a routing hint, so being wrong costs
+one attempt and falls through.
+
+**Not every tab in the master workbook is a company.** The same file holds
+archive layouts (company as a *column*, plus a Birganj-arrival date), a
+headerless sheet, and a bulk-tanker sheet whose "BL NO" values are `39`/`40`/`87`
+against `MT …` motor tankers — shore-tank parcels with no container to track.
+Tabs are classified by what their headers contain, never by name, and every
+skipped tab is reported with a reason. A company sheet that silently stopped
+being read is the failure mode to guard against.
+
+**The commercial sheet's dates are not used.** Its `ETA BRJ`, `ETA Viz/Kol`,
+`LC DATE` and `BL DATE` columns are typed by hand and not maintained against the
+carriers, so the report takes **every arrival date from the carriers instead**.
+The raw text is still kept and shown on Commercial Shipments marked `NOT USED`,
+so nothing is lost and the sheet stays auditable. The switch is
+`TRUST_SHEET_DATES` in [read_master.py](read_master.py), and
+[read_sheet.py](read_sheet.py) imports the same flag so the two readers cannot
+drift.
+
+The one sheet value that survives is `FREE TIME` when it holds a **day count**
+(`14`) rather than a date. That is a contractual term, not a guess, and combined
+with the carrier's discharge event it still gives a sound detention clock. Where
+the cell holds a date instead, no expiry is claimed.
+
+**Row numbers restart on every company tab.** NICPL row 3 and PBT row 3 are
+different shipments. A shipment row's identity is **(company, row_number)** —
+keying on the number alone silently dropped half the rows, and the row-count
+ledger still balanced because it counted them as duplicates collapsed.
 
 **Maersk never returns a bill of lading.** `bill_of_lading` is always null on a
 Maersk row even when you searched with the real BL. Join on `tracking_number`.

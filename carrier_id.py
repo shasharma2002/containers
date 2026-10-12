@@ -20,7 +20,12 @@ the same as who is CARRYING it.
 
 So treat this as routing hint plus fallback, never as proof. The only real
 confirmation is a successful lookup. The classifier returns a confidence level
-so you can decide whether to trust it or just try every carrier.
+so you can decide whether to trust it or just try every carrier:
+
+    high      a carrier-owned container prefix, or a carrier-issued BL prefix
+    medium    a bare-numeric BL, which only Maersk issues. Worth trying first,
+              not worth believing -- see the note in classify()
+    unknown   a leasing prefix, or nothing recognisable. Try every carrier
 
 WHY YOUR SIX FAILED
 -------------------
@@ -163,6 +168,27 @@ def classify(number: str) -> dict:
                     "carrier_name": CARRIER_NAMES.get(carrier, carrier),
                     "confidence": "high",
                     "note": f"{prefix} is a {CARRIER_NAMES.get(carrier)} BL prefix"}
+
+    # A bare 9-12 digit BL. No prefix means no carrier can be read off it, but
+    # the shape itself is a strong signal: Maersk issues bare-numeric BLs while
+    # every other line this project ships with prefixes theirs (MEDU..., HLCU...,
+    # ONEY...). In the project's own commercial sheets, EVERY row whose SHIPPING
+    # LINE said MAERSK carried a bare numeric BL, and no row of any other line
+    # did.
+    #
+    # This matters because the master workbook (all_companies.xlsx) has no
+    # SHIPPING LINE column at all. Without this rule, roughly half the live BLs
+    # classify as "unknown" and run_sheet_mode skips them as inland cargo
+    # without ever attempting a lookup.
+    #
+    # Returned as MEDIUM confidence, not high: it is a routing hint, so being
+    # wrong costs one wasted attempt and the caller falls through to the other
+    # carriers. Never treat it as proof.
+    if BL_NUMERIC_RE.match(n):
+        return {"number": n, "kind": "bill_of_lading", "carrier": "MAEU",
+                "carrier_name": CARRIER_NAMES["MAEU"], "confidence": "medium",
+                "note": "bare numeric BL -- Maersk issues these; other lines "
+                        "prefix theirs. Hint only, verified by the lookup."}
 
     return {"number": n, "kind": "unknown", "carrier": None, "carrier_name": None,
             "confidence": "unknown", "note": "not a recognisable container or BL"}

@@ -413,13 +413,21 @@ def test_edge_cases(tmp: Path) -> None:
     check("all-null fields: workbook opens", ok, detail)
     check("all-null fields: ledger balances", balanced)
     checks = {f["check"] for f in validate.findings(data, BASE)}
-    check("missing ETA reported as a data gap, not a delay",
-          any(f["category"] == "No ETA from carrier" and f["class"] == "Data"
-              for f in data.exceptions))
+    check("missing ETA is a data-quality note, never an action",
+          "No ETA from the carrier" in checks
+          and not any("ETA from" in f["category"] for f in data.exceptions),
+          str(sorted(checks)))
     check("missing description reported",
           "Missing event description" in checks, str(sorted(checks)))
     check("missing tracking number reported",
           "No tracking number" in checks, str(sorted(checks)))
+
+    check("every row on the action list is actionable",
+          all(f["class"] == "Shipment" for f in data.exceptions),
+          str({f["class"] for f in data.exceptions}))
+    check("tracking failures are not repeated as actions",
+          not any("Tracking failure" in f["category"] for f in data.exceptions),
+          str([f["category"] for f in data.exceptions]))
 
     # ---- invalid dates ----------------------------------------------------- #
     directory = write_fixture(
@@ -508,9 +516,80 @@ def test_edge_cases(tmp: Path) -> None:
     data, _, _, balanced = generate(directory, tmp / "minimal.xlsx")
     wb = load_workbook(tmp / "minimal.xlsx")
     check("optional inputs absent: sheets omitted cleanly",
-          excel.S_SHIPMENTS not in wb.sheetnames
-          and excel.S_FAILURES not in wb.sheetnames)
+          excel.S_FREETIME not in wb.sheetnames
+          and excel.S_FAILURES not in wb.sheetnames,
+          str(wb.sheetnames))
     check("optional inputs absent: workbook still balances", balanced)
+
+
+    # ---- multi-company: row_number collides across company sheets ---------- #
+    # The master workbook gives each company its own tab, and every tab restarts
+    # its row numbering. Keying shipment rows on row_number alone made the later
+    # company overwrite the earlier one, and the row-count ledger still balanced
+    # because it counted the losses as duplicates collapsed.
+    def sheet_row(company, number, bl, beneficiary):
+        return {"run_id": "r1", "snapshot_at": BASE.isoformat() + "+00:00",
+                "company": company, "row_number": number, "bl_number": bl,
+                "carrier_name": "Maersk", "beneficiary": beneficiary,
+                "broker": None, "commodity": "SOYBEANS", "pi_no": "PI1",
+                "qty": 100.0, "amount": None, "delivery_terms": None,
+                "free_days": 14, "sheet_eta_date": "2026-09-30",
+                "sheet_eta_place": "BRJ", "eta_port_date": "2026-09-20",
+                "free_time_expiry": None, "tracked_eta": None,
+                "tracked_status": "IN TRANSIT", "tracked_location": None,
+                "container_count": 1,
+                "containers": bl and "AAAU1111111"}
+
+    cs, es = [], []
+    for company, bl in (("NICPL", "270000001"), ("PBT", "270000002")):
+        cid = "BOX%s000001" % company[0]
+        cs.append(container(cid, "MAEU", "Maersk", query=bl, tracking_number=bl))
+        es.append(event(cid, "MAEU", 0, -3, "Discharg", status="CURRENT",
+                        tracking_number=bl))
+    sheet = [sheet_row("NICPL", 3, "270000001", "SUPPLIER A"),
+             sheet_row("PBT", 3, "270000002", "SUPPLIER B")]
+    directory = write_fixture(tmp / "companies", cs, es, shipments=sheet)
+    data, kpi, ledger, balanced = generate(directory, tmp / "companies.xlsx",
+                                           as_of=BASE)
+    check("same row_number on two company sheets: both rows kept",
+          len(data.shipments) == 2,
+          "%d of 2 kept: %s" % (len(data.shipments),
+                                [(s.get("company"), s.get("row_number"))
+                                 for s in data.shipments]))
+    check("both companies reach the report",
+          {s["company"] for s in data.shipments} == {"NICPL", "PBT"},
+          str({s.get("company") for s in data.shipments}))
+    check("company joined onto its BL row",
+          {r["bl"]: r["company"] for r in data.shipment_rows}
+          == {"270000001": "NICPL", "270000002": "PBT"},
+          str({r["bl"]: r["company"] for r in data.shipment_rows}))
+    check("multi-company collapse balances", balanced)
+    check("multi-company noted on Data Quality",
+          any("covers 2 companies" in n["message"] for n in data.notes),
+          str([n["message"][:60] for n in data.notes]))
+
+    # Genuine duplicates of the SAME (company, row) must still collapse, newest
+    # snapshot winning.
+    later = (BASE + timedelta(days=5)).isoformat() + "+00:00"
+    old = sheet_row("NICPL", 3, "270000001", "OLD NAME")
+    new = dict(old, beneficiary="NEW NAME", snapshot_at=later)
+    directory = write_fixture(tmp / "companies2", cs, es, shipments=[old, new])
+    data, _, _, balanced = generate(directory, tmp / "companies2.xlsx", as_of=BASE)
+    check("same (company, row) collapses to the newest snapshot",
+          len(data.shipments) == 1
+          and data.shipments[0]["beneficiary"] == "NEW NAME",
+          str([(s["beneficiary"], s.get("snapshot_at")) for s in data.shipments]))
+    check("run-stamped collapse balances", balanced)
+
+    # A row with no BL is commercial data with nothing to track. It must survive.
+    no_bl = sheet_row("NICPL", 9, None, "AWAITING BL")
+    directory = write_fixture(tmp / "companies3", cs, es,
+                              shipments=[sheet_row("NICPL", 3, "270000001", "A"), no_bl])
+    data, _, _, balanced = generate(directory, tmp / "companies3.xlsx", as_of=BASE)
+    check("sheet row with no BL still reported",
+          any(not s["bl_number"] for s in data.shipments),
+          "%d rows" % len(data.shipments))
+    check("no-BL row balances", balanced)
 
     # ---- schema v1 (no tracking_number) ------------------------------------ #
     v1_container = container("VONE1111111", "MAEU", "Maersk",
@@ -714,7 +793,7 @@ def test_bl_grain(tmp: Path) -> None:
         "amount": 223574.94, "delivery_terms": "CFR BIRGUNJ", "free_days": 14,
         "sheet_eta_date": "2026-08-29", "sheet_eta_place": "DRYPORT",
         "tracked_eta": None, "tracked_status": "IN TRANSIT",
-        "tracked_location": None, "eta_variance_days": 3,
+        "tracked_location": None,
         "container_count": 5, "containers": None,
     }]
     directory = write_fixture(tmp / "bl_join", cs, es, shipments=sheet)
@@ -743,6 +822,283 @@ def test_bl_grain(tmp: Path) -> None:
     check("BL Summary carries the container numbers for drill-down",
           any("STRAYU123456" in str(ws.cell(row=5, column=c).value or "")
               for c in range(1, ws.max_column + 1)))
+
+
+def test_journey_and_detention(tmp: Path) -> None:
+    section("JOURNEY STAGES, FREE TIME AND DOCUMENTS")
+
+    def ship(bl, **extra):
+        row = {"run_id": "r1", "snapshot_at": BASE.isoformat() + "+00:00",
+               "company": "NICPL", "row_number": 3, "bl_number": bl,
+               "carrier_name": "Maersk", "beneficiary": "SUPPLIER A",
+               "broker": None, "commodity": "SOYBEANS", "pi_no": "PI1",
+               "qty": 100.0, "amount": None, "rate": 500.0,
+               "amount_derived": 50000.0, "delivery_terms": None,
+               "free_days": 14,
+               # Deliberately present and deliberately WRONG. Sheet dates are
+               # not trusted, so the report must ignore all three -- the
+               # assertions below prove it rather than assuming it.
+               "free_time_expiry": "2026-01-01",
+               "sheet_eta_date": "2026-01-01", "sheet_eta_place": "BRJ",
+               "eta_port_date": "2026-01-01", "sheet_eta_raw": "01.01.26",
+               "eta_port_raw": "01.01.26", "free_time_raw": "14",
+               "document_position": "ok",
+               "tracked_eta": None, "tracked_status": "IN TRANSIT",
+               "tracked_location": None,
+               "container_count": 1, "containers": None}
+        row.update(extra)
+        return row
+
+    def journey(cid, bl, legs):
+        """legs: (days_from_BASE, description, city). Future dates are PLANNED."""
+        return [event(cid, "MAEU", seq, days, desc,
+                      status="COMPLETED" if days <= 0 else "PLANNED",
+                      city=city, country="XX", tracking_number=bl)
+                for seq, (days, desc, city) in enumerate(legs)]
+
+    # ---- a transshipment must NOT start the free-time clock ---------------- #
+    # Discharged at COLOMBO with a further sea leg still ahead. Colombo is a hub:
+    # the box was never available for collection, so no detention can accrue.
+    # This is the case that was wrong on the first attempt.
+    cs = [container("TRANU000001", "MAEU", "Maersk", query="BLTRANS001",
+                    tracking_number="BLTRANS001", port_of_discharge="VISAKHAPATNAM")]
+    es = journey("TRANU000001", "BLTRANS001", [
+        (-40, "Gate In", "BALTIMORE"), (-38, "Load", "BALTIMORE"),
+        (-37, "Container Departure", "BALTIMORE"),
+        (-6, "Container Arrival", "COLOMBO"), (-6, "Discharg", "COLOMBO"),
+        (10, "Container Departure", "COLOMBO"),
+        (18, "Container Arrival", "VISAKHAPATNAM")])
+    directory = write_fixture(tmp / "transship", cs, es,
+                              shipments=[ship("BLTRANS001")])
+    data, kpi, _, balanced = generate(directory, tmp / "transship.xlsx", as_of=BASE)
+    row = data.shipment_rows[0]
+    check("discharge at a transshipment hub is not a port arrival",
+          row["port_arrival_dt"] is None, str(row["port_arrival_location"]))
+    check("no free-time clock started at the hub",
+          row["free_time_expiry"] is None and row["containers_at_port"] == 0,
+          "%s / %s" % (row["free_time_expiry"], row["containers_at_port"]))
+    check("free time status says not yet ashore",
+          row["free_time_status"] == "Not yet ashore", row["free_time_status"])
+    check("no detention finding raised for a hub discharge",
+          not [f for f in data.exceptions if "Free time" in f["category"]],
+          str([f["category"] for f in data.exceptions]))
+    check("transshipment fixture balances", balanced)
+
+    # ---- the final discharge DOES start it -------------------------------- #
+    cs = [container("FINLU000001", "MAEU", "Maersk", query="BLFINAL001",
+                    tracking_number="BLFINAL001")]
+    es = journey("FINLU000001", "BLFINAL001", [
+        (-60, "Gate In", "BALTIMORE"), (-58, "Load", "BALTIMORE"),
+        (-30, "Discharg", "COLOMBO"), (-28, "Load", "COLOMBO"),
+        (-20, "Container Arrival", "VISAKHAPATNAM"),
+        (-20, "Discharg", "VISAKHAPATNAM")])
+    directory = write_fixture(tmp / "ashore", cs, es,
+                              shipments=[ship("BLFINAL001")])
+    data, kpi, _, balanced = generate(directory, tmp / "ashore.xlsx", as_of=BASE)
+    row = data.shipment_rows[0]
+    check("final discharge recognised as the port arrival",
+          row["port_arrival_location"] == "VISAKHAPATNAM, XX",
+          str(row["port_arrival_location"]))
+    check("free time = CARRIER discharge + free days from the sheet",
+          str(row["free_time_expiry"]) == "2026-08-26",
+          "%s (basis: %s)" % (row["free_time_expiry"], row["free_time_basis"]))
+    check("the basis names the carrier discharge, not the sheet",
+          "carrier discharge" in row["free_time_basis"], row["free_time_basis"])
+    # The fixture supplies free_time_expiry = 2026-01-01. If the sheet's own
+    # expiry date were still honoured it would win here, and it must not.
+    check("the sheet's own expiry date is ignored",
+          str(row["free_time_expiry"]) != "2026-01-01",
+          "the sheet date overrode the carrier calculation")
+    check("no sheet ETA reaches the BL row",
+          all(key not in row for key in ("sheet_eta", "eta_port",
+                                         "eta_variance_days")),
+          str([k for k in ("sheet_eta", "eta_port", "eta_variance_days")
+               if k in row]))
+    check("container still at port counted as exposed",
+          row["containers_at_port"] == 1, str(row["containers_at_port"]))
+    check("expired free time raises a critical finding",
+          [f for f in data.exceptions
+           if f["category"] == "Free time expired, cargo still at port"
+           and f["severity"] == "Critical"],
+          str([f["category"] for f in data.exceptions]))
+    check("hub dwell measured separately from port dwell",
+          data.containers[0]["transship_dwell_days"] == 2,
+          str(data.containers[0]["transship_dwell_days"]))
+    check("ashore fixture balances", balanced)
+
+    # ---- railed out: the clock stops, exposure goes to zero --------------- #
+    es_cleared = es + journey("FINLU000001", "BLFINAL001",
+                              [(-18, "Rail Departure", "VISAKHAPATNAM")])
+    directory = write_fixture(tmp / "cleared", cs, es_cleared,
+                              shipments=[ship("BLFINAL001")])
+    data, _, _, _ = generate(directory, tmp / "cleared.xlsx", as_of=BASE)
+    row = data.shipment_rows[0]
+    check("a railed-out box is no longer exposed",
+          row["containers_at_port"] == 0
+          and row["free_time_status"] == "Cleared the port",
+          "%s / %s" % (row["containers_at_port"], row["free_time_status"]))
+    check("no stale countdown once the port is cleared",
+          row["free_days_left"] is None, str(row["free_days_left"]))
+    check("port dwell measured discharge to rail-out",
+          data.containers[0]["port_dwell_days"] == 2,
+          str(data.containers[0]["port_dwell_days"]))
+    check("no detention finding once cleared",
+          not [f for f in data.exceptions if "Free time" in f["category"]])
+
+    # ---- free time expiring soon ------------------------------------------ #
+    cs2 = [container("SOONU000001", "MAEU", "Maersk", query="BLSOON0001",
+                     tracking_number="BLSOON0001")]
+    es2 = journey("SOONU000001", "BLSOON0001", [
+        (-40, "Gate In", "ADELAIDE"), (-38, "Load", "ADELAIDE"),
+        (-12, "Container Arrival", "KOLKATA"), (-12, "Discharg", "KOLKATA")])
+    directory = write_fixture(tmp / "soon", cs2, es2,
+                              shipments=[ship("BLSOON0001")])
+    data, _, _, _ = generate(directory, tmp / "soon.xlsx", as_of=BASE)
+    findings = [f for f in data.exceptions if f["category"] == "Free time expiring"]
+    check("free time expiring within the warning window is flagged", bool(findings),
+          str([f["category"] for f in data.exceptions]))
+    check("expiring finding reports the days remaining",
+          findings and findings[0]["value"] == 2,
+          str(findings[0]["value"]) if findings else "none")
+
+    # ---- no free days stated: say so, never assume an industry default ---- #
+    directory = write_fixture(tmp / "nofree", cs, es,
+                              shipments=[ship("BLFINAL001", free_days=None)])
+    data, _, _, _ = generate(directory, tmp / "nofree.xlsx", as_of=BASE)
+    row = data.shipment_rows[0]
+    check("no free days on the sheet means no expiry is invented",
+          row["free_time_expiry"] is None, str(row["free_time_expiry"]))
+    check("basis explains why there is no expiry",
+          "no free days" in row["free_time_basis"], row["free_time_basis"])
+    check("cargo at port with no free time on record is flagged",
+          [f for f in data.exceptions
+           if f["category"] == "Cargo at port, no free time on record"],
+          str([f["category"] for f in data.exceptions]))
+
+    # ---- document readiness ----------------------------------------------- #
+    for position, expect in (("ok", "Ready"), ("OK 17.08.26", "Ready"),
+                             ("ok, 20.09.26", "Ready"), ("PENDING", "Pending"),
+                             ("PENDING, req sign", "Pending"), (None, "Not stated")):
+        slug = str(position or "none").replace(",", "").replace(" ", "_").replace(".", "")
+        directory = write_fixture(tmp / ("docs_" + slug), cs, es,
+                                  shipments=[ship("BLFINAL001",
+                                                  document_position=position)])
+        data, _, _, _ = generate(directory, tmp / ("docs_%s.xlsx" % slug), as_of=BASE)
+        check("document position %r reads as %s" % (position, expect),
+              data.shipment_rows[0]["docs_ready"] == expect,
+              data.shipment_rows[0]["docs_ready"])
+
+    directory = write_fixture(tmp / "docspend", cs, es,
+                              shipments=[ship("BLFINAL001",
+                                              document_position="PENDING")])
+    data, _, _, _ = generate(directory, tmp / "docspend.xlsx", as_of=BASE)
+    check("pending documents with cargo already ashore is critical",
+          [f for f in data.exceptions
+           if f["category"] == "Documents not ready and cargo arriving"
+           and f["severity"] == "Critical"],
+          str([(f["severity"], f["category"]) for f in data.exceptions]))
+
+    # ---- lane benchmarks need history before they mean anything ----------- #
+    cs3, es3, sheet3 = [], [], []
+    for index in range(4):
+        cid = "LANEU00000%d" % index
+        bl = "BLLANE000%d" % index
+        cs3.append(container(cid, "MAEU", "Maersk", query=bl, tracking_number=bl,
+                             origin_city="ADELAIDE", origin_country="AU",
+                             destination_city="BIRGANJ", destination_country="NP"))
+        span = 30 if index < 3 else 60          # the fourth runs twice as long
+        es3 += journey(cid, bl, [(-span - 10, "Gate In", "ADELAIDE"),
+                                 (-span - 8, "Load", "ADELAIDE"),
+                                 (-4, "Discharg", "VISAKHAPATNAM"),
+                                 (-2, "Rail Departure", "VISAKHAPATNAM"),
+                                 (0, "Rail Arrival At Destination", "BIRGANJ")])
+        sheet3.append(ship(bl, row_number=10 + index))
+    directory = write_fixture(tmp / "lanes", cs3, es3, shipments=sheet3)
+    data, _, _, balanced = generate(directory, tmp / "lanes.xlsx", as_of=BASE)
+    lanes = analyze.lane_rows(data)
+    check("lane benchmark built from completed journeys only", bool(lanes), str(lanes))
+    check("lane usable once it has enough journeys",
+          lanes and lanes[0]["usable"] is True
+          and lanes[0]["journeys"] >= analyze.LANE_MIN_JOURNEYS,
+          str(lanes[0]) if lanes else "none")
+    check("lane fixture balances", balanced)
+
+    directory = write_fixture(tmp / "lane1", cs3[:1], es3[:5], shipments=sheet3[:1])
+    data, _, _, _ = generate(directory, tmp / "lane1.xlsx", as_of=BASE)
+    lanes = analyze.lane_rows(data)
+    check("a one-journey lane is NOT usable as a benchmark",
+          lanes and lanes[0]["usable"] is False, str(lanes[0]) if lanes else "none")
+    check("no slow-lane finding without a usable benchmark",
+          not [f for f in data.exceptions
+               if f["category"] == "Slower than this lane normally runs"])
+
+    # ---- the new sheets exist, and are omitted when they cannot be filled -- #
+    wb = load_workbook(tmp / "ashore.xlsx")
+    for sheet in (excel.S_FREETIME, excel.S_COMPANIES,
+                  excel.S_PORTS, excel.S_LANES):
+        check("sheet %r present" % sheet, sheet in wb.sheetnames, str(wb.sheetnames))
+
+    directory = write_fixture(tmp / "nosheet", cs, es)
+    data, _, _, _ = generate(directory, tmp / "nosheet.xlsx", as_of=BASE)
+    wb = load_workbook(tmp / "nosheet.xlsx")
+    check("free time sheet omitted when there is no commercial sheet",
+          excel.S_FREETIME not in wb.sheetnames, str(wb.sheetnames))
+
+    # ---- a sheet date alone must not produce an arrival ------------------- #
+    # No carrier events at all, but the sheet states an ETA. The Arrivals
+    # Planner must stay empty rather than present a hand-typed date as an
+    # arrival.
+    bare = [container("NOEVU000001", "MAEU", "Maersk", query="BLNOEV0001",
+                      tracking_number="BLNOEV0001", pod_eta=None,
+                      final_pod_eta=None, current_date=None)]
+    directory = write_fixture(tmp / "sheetonly", bare,
+                              [event("NOEVU000001", "MAEU", 0, -3, "Gate In",
+                                     tracking_number="BLNOEV0001")],
+                              shipments=[ship("BLNOEV0001")])
+    data, _, _, balanced = generate(directory, tmp / "sheetonly.xlsx", as_of=BASE)
+    arrivals = analyze.arrival_rows(data, BASE)
+    check("a sheet ETA alone does not create an arrival", not arrivals,
+          str([(r["bl"], r["arrival_date"], r["arrival_basis"]) for r in arrivals]))
+    check("every arrival that IS reported comes from a carrier source",
+          all("carrier" in r["arrival_basis"] or "arrived" in r["arrival_basis"]
+              for r in analyze.arrival_rows(data, BASE)))
+    check("sheet-only fixture balances", balanced)
+
+    # ---- a box mid-ocean must NOT be flagged for sitting still ------------ #
+    # These routes run 40-day sea legs, so weeks without a scan is the normal
+    # state of a loaded vessel. Flagging it was 7 of 8 findings nobody could act
+    # on. Only a box standing at a port or hub is worth a human's time.
+    mid = [container("OCEAU000001", "MAEU", "Maersk", query="BLOCEAN001",
+                     tracking_number="BLOCEAN001")]
+    mid_events = journey("OCEAU000001", "BLOCEAN001", [
+        (-60, "Gate In", "BALTIMORE"), (-58, "Load", "BALTIMORE"),
+        (-57, "Container Departure", "BALTIMORE")])
+    directory = write_fixture(tmp / "midocean", mid, mid_events,
+                              shipments=[ship("BLOCEAN001")])
+    data, _, _, balanced = generate(directory, tmp / "midocean.xlsx", as_of=BASE)
+    idle = data.containers[0]["idle_at_snapshot_days"]
+    check("a box 57 days without a scan mid-ocean is not flagged",
+          idle is not None and idle > analyze.STALE_CRITICAL_DAYS
+          and not [f for f in data.exceptions if "Sitting still" in f["category"]],
+          "idle=%s findings=%s" % (idle, [f["category"] for f in data.exceptions]))
+    check("mid-ocean fixture balances", balanced)
+
+    # ...but the same idle time AT A PORT is flagged.
+    port_events = mid_events + journey("OCEAU000001", "BLOCEAN001",
+                                       [(-20, "Discharg", "VISAKHAPATNAM")])
+    directory = write_fixture(tmp / "atport", mid, port_events,
+                              shipments=[ship("BLOCEAN001")])
+    data, _, _, _ = generate(directory, tmp / "atport.xlsx", as_of=BASE)
+    check("the same idle time standing at a port IS flagged",
+          [f for f in data.exceptions if "Sitting still" in f["category"]],
+          str([f["category"] for f in data.exceptions]))
+
+    # ---- ports sheet must separate the two kinds of location -------------- #
+    data, _, _, _ = generate(tmp / "ashore", tmp / "ports.xlsx", as_of=BASE)
+    kinds = {r["location"]: r["kind"] for r in analyze.port_rows(data)}
+    check("destination port and transshipment hub labelled differently",
+          kinds.get("VISAKHAPATNAM, XX") == "Destination port"
+          and kinds.get("COLOMBO, XX") == "Transshipment hub", str(kinds))
 
 
 def test_large(tmp: Path) -> None:
@@ -792,7 +1148,7 @@ def main() -> int:
     print("Temp fixtures: %s" % tmp)
     try:
         for test in (test_real_data, test_eight_carriers, test_bl_grain,
-                     test_edge_cases, test_large):
+                     test_journey_and_detention, test_edge_cases, test_large):
             try:
                 test(tmp)
             except Exception:

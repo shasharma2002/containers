@@ -44,6 +44,7 @@ import maersk_browser
 import maersk_track
 import msc_track
 import pipeline
+import read_master
 import read_sheet
 import track_all
 
@@ -318,9 +319,144 @@ def test_sheet_parsing() -> None:
           "BL NO. header not found -- check the sheet layout")
 
 
+def test_master_workbook() -> None:
+    section("MASTER WORKBOOK -- one sheet per company")
+
+    path = Path("all_companies.xlsx")
+    if not path.exists():
+        print("  SKIP  all_companies.xlsx not present")
+        return
+
+    check("detected as a master workbook", read_master.looks_like_master(path))
+    result = read_master.get_shipments(path)
+    shipments = result["shipments"]
+
+    companies = {info["company"] for info in result["sheets"]}
+    check("company taken from the sheet name, not a column",
+          companies and all(s["company"] in companies for s in shipments),
+          str(companies))
+
+    # Only live per-company tabs are parsed. The rest must be skipped WITH a
+    # reason -- a company sheet that silently stopped being read is the failure
+    # mode worth guarding against.
+    layouts = {info["sheet"]: info["layout"] for info in result["skipped"]}
+    check("archive tabs skipped, not parsed",
+          layouts.get("material reach 82-83") == "archive"
+          and layouts.get("material reach 79-80") == "archive", str(layouts))
+    check("bulk tanker tab skipped", layouts.get("OIL TANKER") == "tanker",
+          str(layouts))
+    check("headerless tab skipped rather than guessed at",
+          layouts.get("material reached 78-79") == "noheader", str(layouts))
+    check("every skipped tab carries a reason",
+          all(info["reason"] for info in result["skipped"]))
+
+    # Phantom formatting rows: NICPL claims over a million rows.
+    nicpl = [info for info in result["sheets"] if info["company"] == "NICPL"]
+    check("phantom blank rows not read as data",
+          nicpl and nicpl[0]["rows"] < 100,
+          "%d rows" % (nicpl[0]["rows"] if nicpl else -1))
+
+    # Rows with no BL are kept for the report but must never reach a carrier.
+    no_bl = [s for s in shipments if not s["bl_number"]]
+    check("rows with no BL are kept, not dropped", bool(no_bl),
+          "%d rows" % len(no_bl))
+
+    # A BL cell holding more than a BL.
+    bl, carrier, extra = read_master.split_bl_cell("HLCUMTR260616918,\nhappag")
+    check("BL cell split: BL and carrier separated",
+          bl == "HLCUMTR260616918" and carrier == "HAPPAG",
+          "%r / %r / %r" % (bl, carrier, extra))
+    bl, carrier, extra = read_master.split_bl_cell("HLCUMTR260830603,\nCONFCIU6646940")
+    check("BL cell split: leftover kept, not discarded",
+          bl == "HLCUMTR260830603" and extra,
+          "%r / %r / %r" % (bl, carrier, extra))
+    bl, _, extra = read_master.split_bl_cell("ELG/RGN/CCU-1638/26,ELAN,TLPL")
+    check("forwarder references yield no BL but are preserved",
+          bl is None and extra, "%r / %r" % (bl, extra))
+    check("a float-stored numeric BL is not read as '272573330.0'",
+          read_master.split_bl_cell(272573330.0)[0] == "272573330",
+          str(read_master.split_bl_cell(272573330.0)))
+
+    # Day-first dates, including the sheet's '022' year form.
+    for raw, expect in (("31.07.26", "2026-07-31"), ("04-10-26", "2026-10-04"),
+                        ("15/7/2022", "2022-07-15"), ("20.01.022", "2022-01-20"),
+                        ("ok, 20.09.26", "2026-09-20"), ("not a date", None),
+                        ("", None), (None, None)):
+        check("date %r -> %s" % (raw, expect),
+              read_master.parse_sheet_date(raw) == expect,
+              "got %r" % read_master.parse_sheet_date(raw))
+
+    # FREE TIME mixes a day count and an expiry date. The COUNT survives -- it
+    # is a contractual term. The DATE is suppressed with every other sheet date.
+    days = [s for s in shipments if s["free_days"] is not None]
+    check("FREE TIME day counts are kept", bool(days),
+          "%d rows with a day count" % len(days))
+    check("a dated FREE TIME cell yields no day count",
+          all(s["free_days"] is None for s in shipments
+              if s["free_time_raw"] and read_master.parse_sheet_date(s["free_time_raw"])),
+          "a date was read as a day count")
+
+    # ---- sheet dates are deliberately not published ----------------------- #
+    # The commercial workbook's date columns are typed by hand and not kept in
+    # step with the carriers, so the reader keeps the raw text and suppresses
+    # every parsed date. Arrival dates on the report come from carriers only.
+    check("TRUST_SHEET_DATES is off", read_master.TRUST_SHEET_DATES is False)
+    for field in read_master.SHEET_DATE_FIELDS:
+        check("sheet date %r is not published" % field,
+              all(s[field] is None for s in shipments),
+              "%d row(s) still carry it"
+              % sum(1 for s in shipments if s[field] is not None))
+    raw_kept = [s for s in shipments if s["sheet_eta_raw"]]
+    check("the raw sheet ETA text is still kept for audit", bool(raw_kept),
+          "%d row(s) with raw ETA text" % len(raw_kept))
+    check("parse_sheet_date still works on its own",
+          read_master.parse_sheet_date("31.07.26") == "2026-07-31",
+          "the parser is kept; only its use on sheet columns is suppressed")
+
+    # RATE/AMT is a rate; the product must be labelled as derived.
+    rated = [s for s in shipments if s["rate"] and s["qty"]]
+    check("rate kept verbatim and value exposed separately as derived",
+          rated and rated[0]["amount"] is None
+          and rated[0]["amount_derived"] == round(rated[0]["qty"] * rated[0]["rate"], 2),
+          str({k: rated[0][k] for k in ("qty", "rate", "amount", "amount_derived")})
+          if rated else "none")
+
+    both_raw = [s for s in shipments if s["sheet_eta_raw"] and s["eta_port_raw"]]
+    check("both ETA columns captured as raw text", bool(both_raw),
+          "%d rows with both" % len(both_raw))
+
+    # THE COLLISION: every company tab restarts its row numbering.
+    pairs = [(s["company"], s["row_number"]) for s in shipments]
+    check("(company, row_number) is unique", len(pairs) == len(set(pairs)))
+    numbers = [s["row_number"] for s in shipments]
+    check("row_number ALONE collides across companies -- so it cannot be the key",
+          len(numbers) != len(set(numbers)),
+          "%d rows, %d distinct row numbers" % (len(numbers), len(set(numbers))))
+
+    # Routing: the whole point of the bare-numeric rule.
+    routed = {"fetch": 0, "unsupported": 0, "skip": 0}
+    for s in shipments:
+        if not s["bl_number"]:
+            continue
+        info = carrier_id.classify(s["bl_number"])
+        hint = info["carrier"] if info["confidence"] in ("high", "medium") else None
+        if hint in track_all.ADAPTERS:
+            routed["fetch"] += 1
+        elif hint:
+            routed["unsupported"] += 1
+        else:
+            routed["skip"] += 1
+    check("every BL on the master sheet routes somewhere definite",
+          routed["skip"] == 0, str(routed))
+    check("bare-numeric BLs route to Maersk instead of being skipped",
+          routed["fetch"] > 0, str(routed))
+    check("a recognised carrier with no adapter is flagged unsupported, not fetched",
+          routed["unsupported"] > 0, str(routed))
+
+
 def main() -> int:
     for test in (test_schema_parity, test_one_schema_definition,
-                 test_carrier_routing, test_sheet_parsing):
+                 test_carrier_routing, test_sheet_parsing, test_master_workbook):
         try:
             test()
         except Exception:

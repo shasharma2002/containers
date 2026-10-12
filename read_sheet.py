@@ -93,6 +93,10 @@ for _alias in BLNO_ALIASES:
 # None and is track_all.py's decision, not this module's.
 CARRIER_MAP = {"MAERSK": "MAEU", "MSC": "MSCU"}
 
+# Mirrors read_master.TRUST_SHEET_DATES, imported rather than redefined so the
+# two readers cannot drift apart on a question this consequential.
+from read_master import TRUST_SHEET_DATES  # noqa: E402
+
 ETA_RE = re.compile(r"^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{4})\s*(.*)$")
 
 
@@ -285,8 +289,13 @@ def get_shipments(path: Path, sheet: str | None = None) -> dict:
             "delivery_terms": identity["delivery_terms"],
             "free_days": identity["free_days"],
             "sheet_eta_raw": identity["eta_raw"],
-            "sheet_eta_date": eta_date,
-            "sheet_eta_place": eta_place,
+            # Parsed but NOT published. The ETA typed on a commercial sheet is
+            # not maintained against the carriers, so the report takes arrival
+            # dates from the carriers only -- see TRUST_SHEET_DATES in
+            # read_master.py, which states the rule for both workbooks. The raw
+            # text above is kept so nothing is lost.
+            "sheet_eta_date": eta_date if TRUST_SHEET_DATES else None,
+            "sheet_eta_place": eta_place if TRUST_SHEET_DATES else None,
         })
 
     return {
@@ -329,7 +338,7 @@ def main() -> int:
         print(f"row {s['row_number']:<5} BL {s['bl_number']:<20} "
               f"carrier {s['carrier'] or '?':<6} ({s['shipping_line_raw'] or '-'})  "
               f"{(s['beneficiary'] or '')[:24]:<24} {(s['commodity'] or '')[:16]:<16} "
-              f"qty={s['qty']}  ETA {s['sheet_eta_date'] or '-'} @ {s['sheet_eta_place'] or '-'}")
+              f"qty={s['qty']}  ETA(raw, unused) {s['sheet_eta_raw'] or '-'}")
     return 0
 
 

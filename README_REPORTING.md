@@ -57,23 +57,142 @@ tracking run, so it is safe to run mid-run or on a schedule.
 
 | Sheet | For | Contents |
 |---|---|---|
-**Dashboard** | Management | 16 KPI tiles, 9 chart+table pairs, links to every sheet |
-**BL Summary** | Operations | **One row per bill of lading** — the primary sheet |
-**Container Summary** | Operations | One row per container, from that container's most recent tracking result |
-**Event History** | Operations | One row per event — the carrier's original wording next to the normalised status |
-**Carrier Summary** | Both | Per-carrier rollup, carriers derived from the data |
-**Exceptions** | Operations | Findings split into `Shipment` and `Data` classes |
-**Commercial Shipments** | Management | `shipments.json` joined to tracking, with ETA variance (sheet-mode runs only) |
-**Tracking Failures** | Operations | `errors.json`, split into its three distinct kinds |
-**Data Quality** | Both | Row-count ledger + integrity findings |
-**Status Mapping** | Audit | Every event wording seen and what it normalised to |
-**Carrier Mapping** | Audit | All eight target carriers and the coverage the tracker actually has |
-**Run History** | Audit | Every run in the JSON |
-**Raw Containers / Raw Events** | Audit | Every row exactly as read. Hidden — unhide from the tab strip |
+**Dashboard** | Management | 12 KPI tiles, 5 charts, links to every sheet |
+**Shipments** | Operations | **One row per BL** — the sheet to open first. Worst first |
+**Action Required** | Operations | Only things a person can act on |
+**Container Summary** | Operations | Drill-down to individual boxes |
+**Event History** | Operations | Full movement record, carrier wording + normalised |
+**Free Time & Detention** | Operations | Detention exposure |
+**Company Summary** | Management | Per-company rollup |
+**Carrier Summary** | Both | Per-carrier rollup and real coverage |
+**Ports & Hubs** | Both | Where time is lost |
+**Lane Performance** | Management | Real transit times |
+**Tracking Failures** | Operations | What could not be looked up, and why |
+**Data Quality** | Both | Row-count ledger + every data problem, counted once |
+
+Hidden (unhide from the tab strip): **Status Mapping**, **Carrier Mapping**,
+**Run History**, **Raw Sheet Rows**, **Raw Containers**, **Raw Events**.
+
+### What was removed, and why
+
+| Removed | Reason |
+|---|---|
+**Arrivals Planner** sheet | The same rows as Shipments, re-sorted. Shipments now sorts worst-first and carries Carrier ETA + Days To ETA, so Excel's own sort does the rest |
+**Commercial Shipments** sheet | Its tracked columns now sit on Shipments; the rest moved to the hidden **Raw Sheet Rows**, so nothing is lost |
+**Cargo value** (qty × rate) | Rested on reading `RATE/AMT` as a rate per tonne. Nobody asked for the figure and it was an assumption, so it went |
+**Data-class findings** on the action sheet | They duplicated checks `validate.py` already did per container. Every data problem is now reported **once**, on Data Quality |
+**Tracking failures** on the action sheet | They have their own sheet with the carrier's reason and what to do |
+32 columns on Shipments | 50 → 18. A sheet you cannot read at a glance is not a summary |
+22 columns on Container Summary | 35 → 13 |
+11 columns on Event History | 23 → 12. The rest is on Raw Events |
+12 KPI tiles, 9 charts | 24 → 12 tiles, 14 → 5 charts |
 
 One file, not several. The raw sheets are hidden rather than split out, because a
 report you cannot trace back to source rows is not auditable, and a second file
 is a file that gets separated from the first one in an email.
+
+---
+
+## Dates come from the carriers, never from the sheet
+
+The commercial workbook's date columns are typed by hand and are not kept in
+step with the carriers, so **none of them is used**. Every arrival date, ETA and
+free-time expiry on the report is derived from carrier events.
+
+| Sheet column | Status |
+|---|---|
+`ETA BRJ`, `ETA Viz/Kol` | **Not used.** Raw text shown on Commercial Shipments, marked `NOT USED` |
+`LC DATE`, `BL DATE` | **Not used** |
+`FREE TIME` holding a date | **Not used** — no expiry is claimed for that row |
+`FREE TIME` holding a day count (`14`) | **Used.** A contractual term, not a date |
+`DOCUMENT POSITION` | **Wording used** (`ok` vs `PENDING`); any date inside the cell ignored |
+
+Consequences worth knowing:
+
+- **There is no ETA-variance metric.** Comparing a carrier ETA against a date
+  nobody maintains produced a number that looked meaningful and was not, so it
+  is gone rather than left to mislead.
+- **Free time still works**, because the clock starts on the carrier's discharge
+  event. The `How the expiry was worked out` column on every row reads
+  *"carrier discharge YYYY-MM-DD + N free day(s) from the sheet"*, so the inputs
+  are visible per row.
+- **A shipment with no carrier date does not appear on the Arrivals Planner.**
+  It is left off rather than given a hand-typed date — the planner's `Basis`
+  column only ever says *arrived (confirmed)*, *carrier forecast of port
+  discharge*, or *carrier ETA*.
+- Older `shipments.json` files written before this change still contain
+  `sheet_eta_date` and `eta_variance_days`. They are **ignored**, and the Data
+  Quality sheet says so and tells you to re-run the tracker.
+
+To put the sheet's dates back in play, set `TRUST_SHEET_DATES = True` in
+[read_master.py](read_master.py) — `SHEET_DATE_FIELDS` beside it lists exactly
+what that re-enables.
+
+---
+
+## What the report computes beyond "where is it"
+
+Four things that are not in the JSON and have to be derived. All four come from
+real events plus the commercial sheet — none is an assumption.
+
+### Free time and detention
+
+The biggest avoidable cost in this data. Once a box is discharged at the
+**destination** port, the consignee has N free days; after that the carrier
+charges per container per day, and a 23-container BL multiplies that fast.
+
+```
+free time expires = destination-port discharge  (a CARRIER event)
+                  + free days from the sheet    (a day COUNT, not a date)
+```
+
+The sheet's own expiry *date* is **not** honoured — see the section above. Its
+free-days *count* is, because a contractual term does not go stale the way a
+typed date does.
+
+Two rules stop this from crying wolf:
+
+- **Only containers still at the port are exposed.** A BL whose free time ran out
+  three weeks ago but whose boxes all railed out owes nothing. `Free Time Status`
+  therefore leads with the count still on the ground, not a signed number that
+  cannot tell those apart.
+- **No free days on the sheet means no expiry is claimed.** The row says so and
+  raises a *separate* finding, rather than assuming an industry-standard 14.
+  This also covers the rows whose `FREE TIME` cell holds a date instead of a
+  count, since that date is not trusted.
+
+### Destination port vs transshipment hub
+
+This one is subtle and it was wrong in my first cut. **Maersk fires the same
+`DISCHARG` activity at a transshipment hub as at the final port** — only MSC
+labels them distinctly. Real rows from your data: BL `274146535` discharges at
+**Colombo** and BL `274659478` at **Tanjung Pelepas**, both hubs, both reported
+exactly like a final discharge.
+
+So a discharge counts as the destination only when **no vessel leg follows it in
+the itinerary — forecast included**, since Colombo's onward departure is still an
+`EXPECTED` event while the box sits there. Get this wrong and the free-time clock
+starts weeks early at Colombo, inventing detention that does not exist.
+
+Hub dwell is still measured — it is real delay — just never charged as detention.
+`Ports & Hubs` labels every location as one kind or the other.
+
+### Journey stages
+
+| Column | Means |
+|---|---|
+`Ocean Days` | loaded on vessel → discharged at destination port |
+`Port Dwell (days)` | discharged → moved inland. **Detention territory** |
+`Hub Wait (days)` | discharged at a hub → reloaded. Delay, not detention |
+`Transit So Far (days)` | origin gate-in → arrival at destination |
+
+### Lane benchmarks
+
+Transit time per lane from **your own completed journeys**, so it already
+includes the transshipment waits and rail legs these routes really involve — not
+a carrier's published port-to-port time. A lane needs ≥3 completed journeys
+before it is used to flag anything, and a shipment is only called slow at ≥25%
+over its own lane's median.
 
 ---
 
@@ -140,8 +259,11 @@ Only two things, and both are things the carrier itself told us:
 
 Deliberately *not* called delays:
 
-- **No movement for N days** is staleness. A box can legitimately sit on a vessel
-  for two weeks. It is flagged so someone looks, not as proof of lateness.
+- **Sitting still** is staleness, not lateness — and it is only reported where
+  standing still is actually odd: **on the ground at a destination port, or
+  between vessels at a hub.** A box in open water is not scanned for weeks on
+  these routes, so flagging that produced 7 findings out of 8 that nobody could
+  act on. Removing that assumption is what shrank the action list most.
 - **A missing ETA** is a data gap. MSC supplies no forward schedule on most rows,
   so treating "no ETA" as "late" would mark most MSC shipments delayed because of
   an API design choice.
@@ -233,7 +355,8 @@ The original wording is never replaced — both columns appear on Event History.
 
 - **Thresholds** — the constants at the top of
   [reporting/analyze.py](reporting/analyze.py) (`STALE_WARN_DAYS`,
-  `ETA_SLIP_WARN_DAYS`, `CONTAINER_SPREAD_WARN_DAYS`, `ETA_SPREAD_WARN_DAYS`, …).
+  `ETA_SLIP_WARN_DAYS`, `CONTAINER_SPREAD_WARN_DAYS`, `ETA_SPREAD_WARN_DAYS`,
+  `FREE_TIME_WARN_DAYS`, `LANE_MIN_JOURNEYS`, `DOCS_DEADLINE_DAYS`, …).
   They are interpolated into the sheet legends, so the report explains itself
   after you change them.
 - **What counts as containers diverging on a BL** — `DIVERGENCE_FIELDS` in
@@ -295,12 +418,16 @@ prints this distinction at the end rather than reporting eight carriers as
   a single run there is no history, so the report reports no slips — correctly,
   rather than guessing. `out/` demonstrates this: 0 delayed, because one run
   cannot show a revision.
-- **`shipments.json` has no `run_id`.** With `--append` the same sheet rows are
-  rewritten each run and there is nothing to order them by. The report collapses
-  to the last occurrence of each `row_number`, relying on append order being
-  chronological. That assumption is stated on the Data Quality sheet. Adding
-  `run_id` to those rows in `track_all.build_shipments` would remove the need
-  for it.
+- **Multi-company row numbering.** Each company tab in the master workbook
+  restarts its row numbers, so a shipment row is identified by
+  **(company, row_number)**. Rows from the older `bl_list.xlsx`, which states no
+  company, fall back to `row_number` alone — correct for a single-sheet
+  workbook.
+- **`shipments.json` run stamps.** Rows written by current code carry
+  `run_id`/`snapshot_at`, and the newest snapshot per (company, row) wins. Files
+  written before that was added have no stamp, and the report falls back to
+  append order being chronological — flagged as a warning on the Data Quality
+  sheet, not assumed silently.
 - **Maersk rows never carry a bill of lading.** That endpoint does not return
   one, so the Bill of Lading column is always blank for Maersk. Join on
   `Tracking No. / BL` instead.
@@ -314,6 +441,22 @@ prints this distinction at the end rather than reporting eight carriers as
 - **Charts are static.** openpyxl writes chart definitions, not pivot caches, so
   the charts do not respond to the table filters. Filter a table and read the
   numbers; the charts show the whole dataset.
+- **Cargo value is derived, not stated.** The master sheet holds a RATE per
+  tonne, so value is quantity × rate. Treat it as an indication of exposure, not
+  an invoice figure — and it is blank wherever either input is missing.
+- **Detention rates are not in the data**, so the report says how many containers
+  are exposed and for how long, never a currency amount. Add a per-diem per
+  carrier to the sheet and that becomes computable.
+- **Free time is assumed to start at discharge.** Some carriers start it at
+  gate-in or on a combined demurrage/detention clock. If yours differ, the basis
+  column makes it obvious what was assumed on every row.
+- **The commercial sheet's ETA columns are unused**, so there is no comparison
+  between what the commercial team expected and what the carrier says. If those
+  columns are ever maintained properly, flip `TRUST_SHEET_DATES` and the
+  variance metric can come back.
+- **Lane benchmarks need finished journeys.** A lane appears only once cargo has
+  completed it, so this sheet fills out over weeks rather than being useful on
+  day one.
 - **No trend sheet.** The history is used for ETA slip, but the workbook does not
   chart a container's position over time. `--all-snapshots` plus a pivot table is
   the workaround.

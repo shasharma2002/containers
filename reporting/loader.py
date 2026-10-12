@@ -302,9 +302,19 @@ def _dedupe_shipments(rows: list[dict], data: Dataset) -> list[dict]:
     byte-identical copies plus 40 rows that differ because the tracked ETA
     moved between runs.
 
-    `row_number` is the sheet line the row came from, so it is the natural
-    identity. Picking the CURRENT copy of each one depends on what the file
-    carries:
+    The identity of a sheet row is (COMPANY, row_number), not row_number alone.
+    That matters as soon as the input is the multi-company master workbook:
+    every company tab restarts its numbering, so NICPL row 3 and PBT row 3 both
+    exist and are completely different shipments. Keying on row_number alone
+    made the later sheet overwrite the earlier one -- 14 of 30 rows vanished,
+    and the reconciliation ledger still balanced because it counted them as
+    duplicates collapsed. A wrong explanation passes a row-count check, which is
+    why the key has to be right rather than merely accounted for.
+
+    Rows from the older single-sheet bl_list.xlsx carry no company and fall back
+    to row_number alone, which is correct for a workbook with one sheet.
+
+    Picking the CURRENT copy of each identity depends on what the file carries:
 
       snapshot_at present -- the newest snapshot wins, the same rule
                              containers.json uses. Authoritative.
@@ -327,8 +337,11 @@ def _dedupe_shipments(rows: list[dict], data: Dataset) -> list[dict]:
     stamped = sum(1 for r in rows if r.get("snapshot_at"))
 
     for row in rows:
-        key = row.get("row_number")
-        if key in (None, ""):
+        number = row.get("row_number")
+        # Company scopes the row number. See the docstring: without it, tab 2's
+        # row 3 overwrites tab 1's row 3.
+        key = (row.get("company"), number) if number not in (None, "") else None
+        if key is None:
             fingerprint = json.dumps(row, sort_keys=True, default=str)
             if fingerprint in unkeyed:
                 identical += 1
@@ -359,6 +372,27 @@ def _dedupe_shipments(rows: list[dict], data: Dataset) -> list[dict]:
             latest_by_row[key] = row
 
     kept = [latest_by_row[k] for k in order] + list(unkeyed.values())
+
+    legacy_dates = [row for row in rows
+                    if row.get("sheet_eta_date") or row.get("eta_variance_days")
+                    is not None]
+    if legacy_dates:
+        data.note("info", "shipments",
+                  "%d shipment row(s) were written before the sheet's own dates "
+                  "were dropped and still carry sheet_eta_date / "
+                  "eta_variance_days. Those values are IGNORED: the commercial "
+                  "sheet's ETA columns are typed by hand and not maintained "
+                  "against the carriers, so every arrival date on this report "
+                  "comes from the carrier. Re-run the tracker to stop writing "
+                  "them." % len(legacy_dates), len(legacy_dates))
+
+    companies = {row.get("company") for row in rows if row.get("company")}
+    if len(companies) > 1:
+        data.note("info", "shipments",
+                  "shipments.json covers %d companies (%s). Sheet rows are "
+                  "identified by company AND row number, since each company tab "
+                  "restarts its numbering."
+                  % (len(companies), ", ".join(sorted(companies))))
 
     if identical or superseded:
         if stamped == len(rows) and rows:
@@ -534,11 +568,29 @@ def _derive_error(row: dict) -> dict:
 
 
 def _derive_shipment(row: dict) -> dict:
+    """One shipments.json row -> the row the report uses.
+
+    `company` and the origin / port-of-loading fields come from the
+    multi-company master workbook (read_master.py) and are simply absent on rows
+    produced from the older single-sheet bl_list.xlsx. .get() throughout so both
+    formats work without the report caring which one produced the file.
+
+    NO SHEET DATE IS PARSED HERE. The commercial workbook's ETA columns are
+    typed by hand and are not maintained against the carriers, so the report
+    takes every arrival date from the carriers instead -- see TRUST_SHEET_DATES
+    in read_master.py. Older shipments.json files written before that rule may
+    still contain sheet_eta_date and eta_variance_days; they are ignored rather
+    than read, and the Data Quality sheet says so.
+    """
     code = nz.carrier_code(row.get("carrier_name"))
     return {
         **row,
         "carrier_code": code,
         "carrier_display": nz.carrier_name(code, row.get("carrier_name")),
-        "sheet_eta_dt": nz.parse_dt(row.get("sheet_eta_date")),
+        # Left as None when absent rather than given a placeholder: a
+        # placeholder would join as if it were a real company name, and a
+        # BL that appears in BOTH input workbooks would come out labelled
+        # "(not stated); PBT". Display substitution happens at the edge.
+        "company": row.get("company") or None,
         "tracked_eta_dt": nz.parse_dt(row.get("tracked_eta")),
     }
